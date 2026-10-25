@@ -46,8 +46,15 @@ def eprint(*a) -> None:
 
 # --- local Orca CLI ---------------------------------------------------------
 def resolve_orca_cli(cfg: dict) -> str:
-    """Never fall back to bare `orca` on Linux: that is the GNOME screen reader."""
-    cand = os.environ.get("ORCA_CLI_COMMAND") or cfg.get("orca_cli") or "orca-ide"
+    """Never fall back to bare `orca` on Linux: that is the GNOME screen reader.
+
+    On Windows and macOS the Orca CLI is installed as `orca`, so it is the fallback there.
+    """
+    cand = os.environ.get("ORCA_CLI_COMMAND") or cfg.get("orca_cli")
+    if not cand:
+        cand = "orca-ide"
+        if not shutil.which(cand) and sys.platform in ("win32", "darwin"):
+            cand = "orca"
     path = shutil.which(cand)
     if not path:
         raise SystemExit(f"Orca CLI {cand!r} not found (set orca_cli in {CONFIG_PATH})")
@@ -352,6 +359,14 @@ def print_plan(target: dict, plan: list[dict], mode: str) -> None:
           "(control host last); a failure stops the rollout.")
 
 
+def ask(prompt: str) -> str:
+    """input() that treats EOF as no TTY (on Windows, NUL claims to be a TTY)."""
+    try:
+        return input(prompt)
+    except EOFError:
+        raise SystemExit("refusing to update without confirmation (no TTY); re-run with --yes after review")
+
+
 def confirm(args, plan: list[dict]) -> bool:
     todo = [p["server"] for p in plan if p["action"].startswith("update")]
     if not todo:
@@ -365,9 +380,9 @@ def confirm(args, plan: list[dict]) -> bool:
     if args.mode == "force":
         print("\nWARNING: FORCE restarts orca serve even while agents are working. Terminals live in a "
               "separate daemon and usually survive, but this is NOT guaranteed across versions.")
-        ans = input(f"Type FORCE to update {', '.join(todo)}: ")
+        ans = ask(f"Type FORCE to update {', '.join(todo)}: ")
         return ans.strip() == "FORCE"
-    ans = input(f"\nUpdate {', '.join(todo)}? [y/N] ")
+    ans = ask(f"\nUpdate {', '.join(todo)}? [y/N] ")
     return ans.strip().lower() in {"y", "yes"}
 
 
@@ -425,6 +440,8 @@ def cmd_plan(env: Env, args) -> int:
                                                        for p in plan]}, indent=2, ensure_ascii=False))
     else:
         print_plan(target, plan, args.mode)
+    if args.needs_action:  # for automation prechecks: 0 = something to update or recover
+        return 0 if any(p["action"].startswith(("update", "defer", "recover")) for p in plan) else 1
     return 0
 
 
@@ -585,7 +602,7 @@ def cmd_rollback(env: Env, args) -> int:
     print(f"{s['name']}: {r.get('installed_version')} -> {r.get('rollback_to')} (restarts orca serve)")
     if args.dry_run:
         return 0
-    if not args.yes and (not sys.stdin.isatty() or input("Proceed? [y/N] ").strip().lower() not in {"y", "yes"}):
+    if not args.yes and (not sys.stdin.isatty() or ask("Proceed? [y/N] ").strip().lower() not in {"y", "yes"}):
         print("Aborted.")
         return 1
     r = env.ssh_helper(s, ["rollback", *extra], sudo=True, timeout=120)
@@ -628,7 +645,9 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--write", action="store_true", help=f"write {CONFIG_PATH}")
     d.add_argument("--json", action="store_true")
     common(sub.add_parser("status", help="versions, service and agent state of every server"))
-    common(sub.add_parser("plan", help="show what an update would do (read-only)"), mode=True)
+    pl = common(sub.add_parser("plan", help="show what an update would do (read-only)"), mode=True)
+    pl.add_argument("--needs-action", action="store_true",
+                    help="exit 0 only if a server needs update or recovery (unreachable/skip -> 1)")
     pr = common(sub.add_parser("prepare", help="download + verify packages on servers in parallel"))
     pr.add_argument("--dry-run", action="store_true")
     for name in ("update", "retry"):
@@ -659,6 +678,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None, env: Env | None = None) -> int:
     args = build_parser().parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # e.g. cp932 on a piped Windows console
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     env = env or Env(load_config())
     handlers = {"discover": cmd_discover, "status": cmd_status, "plan": cmd_plan, "prepare": cmd_prepare,
                 "update": cmd_update, "retry": cmd_retry, "progress": cmd_progress,
