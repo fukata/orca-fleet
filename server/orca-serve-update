@@ -531,6 +531,28 @@ class Updater:
     def can_attach(facts: dict, owner_protocol: int) -> bool:
         return owner_protocol == facts["protocol"] or owner_protocol in facts["previous"]
 
+    def pty_session_pids(self) -> list[int]:
+        """PIDs running inside Orca's per-terminal scopes (orca_pty_*.scope) of the service user.
+
+        These are the shells/agents users care about. A daemon that owned no terminal may be
+        recycled by Orca on upgrade; that is not a lost session, so survival is judged here.
+        """
+        uid = pwd.getpwnam(self.config()["service_user"]).pw_uid
+        out = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                if os.stat(f"/proc/{name}").st_uid != uid:
+                    continue
+                with open(f"/proc/{name}/cgroup", encoding="utf-8", errors="replace") as f:
+                    cg = f.read()
+            except OSError:
+                continue
+            if "/orca_pty_" in cg:
+                out.append(int(name))
+        return sorted(out)
+
     def pids_alive(self, pids: list[int]) -> list[int]:
         return [p for p in pids if os.path.exists(f"/proc/{p}")]
 
@@ -935,7 +957,9 @@ class Updater:
             res = "deferred" if _only_deferrals(report) else "failed"
             return self._finish(st, res, error="; ".join(report["blockers"]))
         daemons = self.pty_daemons()
+        sessions = self.pty_session_pids()
         st["pty_daemons_before"] = daemons
+        st["pty_sessions_before"] = len(sessions)
         try:
             self._switch(st, version, arch)
             self._verify(st, version)
@@ -944,7 +968,10 @@ class Updater:
             self.audit("update_failed", op_id=op_id, error=st["error"])
             return self._rollback_after_failure(st, current, arch)
         st["pty_daemons_after"] = self.pids_alive(daemons)
-        st["sessions_preserved"] = st["pty_daemons_after"] == daemons
+        st["pty_daemons_replaced"] = sorted(set(daemons) - set(st["pty_daemons_after"]))
+        lost = sorted(set(sessions) - set(self.pids_alive(sessions)))
+        st["pty_sessions_lost"] = len(lost)
+        st["sessions_preserved"] = not lost
         st["last_success_previous"] = current
         return self._finish(st, "succeeded")
 

@@ -213,8 +213,14 @@ class TestUpdater(osu.Updater):
     def daemon_processes(self):
         return list(self._daemons)
 
+    sessions = [5001, 5002]       # processes inside orca_pty_* scopes
+    dead_after_update = set()     # pids that disappear during the update
+
+    def pty_session_pids(self):
+        return list(self.sessions)
+
     def pids_alive(self, pids):
-        live = {d["pid"] for d in self._daemons}
+        live = ({d["pid"] for d in self._daemons} | set(self.sessions)) - self.dead_after_update
         return [p for p in pids if p in live]
 
 
@@ -494,6 +500,21 @@ class Worker(Base):
                                       "verifying", "done"])
         audit = Path(self.paths["audit"]).read_text().splitlines()
         self.assertTrue(any('"phase": "installing"' in l for l in audit))
+
+    def test_recycled_empty_daemon_is_not_a_lost_session(self):
+        self.u._daemons = [{"pid": 4242, "protocol": 48}, {"pid": 4343, "protocol": 51}]
+        self.u.dead_after_update = {4343}   # Orca recycles the session-less v51 daemon
+        self.run_worker()
+        st = self.state()
+        self.assertTrue(st["sessions_preserved"])
+        self.assertEqual(st["pty_daemons_replaced"], [4343])
+
+    def test_lost_terminal_process_is_reported(self):
+        self.u.dead_after_update = {5002}
+        self.run_worker()
+        st = self.state()
+        self.assertFalse(st["sessions_preserved"])
+        self.assertEqual(st["pty_sessions_lost"], 1)
 
     def test_start_failure_rolls_back(self):
         self.sys.fail_start_for = {"1.4.239"}
