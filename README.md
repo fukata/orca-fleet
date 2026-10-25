@@ -300,3 +300,7 @@ E2E の途中で、ユニットテストでは見つからなかったバグを2
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
