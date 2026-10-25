@@ -242,6 +242,24 @@ orca-fleet recover --server dev         # 中断した操作の整合
 orca-fleet update --yes --track         # (Orca ターミナル内) Run/Task に記録
 ```
 
+### ツール自身の更新（self-update）
+
+orca-fleet を複数の PC に入れている場合、リポジトリを変更するたびに各 PC で `install.sh` を実行し直すのは手間です。`self-update` を使うと、各 PC が自分で最新版を取り込みます。
+
+```bash
+orca-fleet self-update                          # clone を git pull --ff-only し、差分のあるファイルだけ配置
+orca-fleet --self-update plan --needs-action    # 先に自己更新し、新しい版でコマンドを実行
+```
+
+- 取り込み元の clone は `--repo`、設定ファイルの `source_repo`、カレントディレクトリの順に探します。automation の workspace をこのリポジトリにしておけば、設定は不要です。
+- 配置するのは `orca-fleet`、`SKILL.md`、Windows では `orca-fleet.cmd` です。中身が同じファイルは書き換えません。
+- 次の場合は警告だけ出して、今のバージョンのまま続行します。更新が止まることはありません。
+  - clone にコミットしていない変更がある（取り込みも配置もしません）
+  - fast-forward できない、またはオフライン
+  - 新しい `orca-fleet` が構文エラーで読み込めない（配置しません）
+- `--self-update` で本体が更新された場合は、新しい版でコマンドを実行し直します。
+- 自動で更新するのはクライアント側だけです。サーバーの `orca-serve-update` は root で動くため、更新は `install.sh` を手で実行し直します。
+
 ### 実行結果の判定（outcome）と通知
 
 `update` / `retry` は最後に、その回の結果を1語で分類した `outcome` と、全サーバーのバージョン分布（`fleet` 行）を出力します。`--json` の出力にも同じ内容が入ります。
@@ -288,7 +306,7 @@ automation の precheck（`plan --needs-action`）で全台 skip だった日は
 ## 9. テスト
 
 ```bash
-python3 -m unittest discover -s tests -v       # 79 tests
+python3 -m unittest discover -s tests -v       # 84 tests
 ```
 
 ### ユニットテストで扱うケース

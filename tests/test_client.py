@@ -416,5 +416,85 @@ class ClientTests(unittest.TestCase):
                 fleet.resolve_orca_cli({})
 
 
+@unittest.skipUnless(fleet.shutil.which("git"), "git not installed")
+class SelfUpdateTests(unittest.TestCase):
+    """A bare 'origin', a clone the tool updates from, and a second clone to push changes."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(fleet.shutil.rmtree, self.tmp, ignore_errors=True)
+        origin, self.clone, self.dev = self.tmp / "origin.git", self.tmp / "clone", self.tmp / "dev"
+        self.git("init", "-q", "--bare", "-b", "main", str(origin))
+        self.git("clone", "-q", str(origin), str(self.dev))
+        self.write(self.dev, "client/orca-fleet", "print('v1')\n")
+        self.write(self.dev, "client/orca-fleet.cmd", "@echo off\r\n")
+        self.write(self.dev, "skill/orca-fleet/SKILL.md", "# v1\n")
+        self.commit(self.dev, "v1")
+        self.git("clone", "-q", str(origin), str(self.clone))
+        bin_dir, skill_dir = self.tmp / "bin", self.tmp / "skills"
+        for name, value in (("INSTALL_DIR", str(bin_dir)), ("SKILL_DIR", str(skill_dir))):
+            p = mock.patch.object(fleet, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.installed = bin_dir / "orca-fleet"
+        self.cfg = {"source_repo": str(self.clone)}
+
+    def git(self, *a, cwd=None):
+        fleet.subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd,
+                             check=True, capture_output=True)
+
+    def write(self, repo, rel, text):
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(text.encode())
+
+    def commit(self, repo, msg):
+        self.git("add", "-A", cwd=repo)
+        self.git("commit", "-q", "-m", msg, cwd=repo)
+        self.git("push", "-q", "origin", "HEAD:main", cwd=repo)
+
+    def test_installs_then_pulls_only_what_changed(self):
+        res = fleet.self_update(self.cfg)
+        self.assertEqual(res["warnings"], [])
+        self.assertEqual(self.installed.read_text(), "print('v1')\n")
+        self.assertEqual(fleet.self_update(self.cfg)["installed"], [])   # nothing differs now
+        self.write(self.dev, "client/orca-fleet", "print('v2')\n")
+        self.commit(self.dev, "v2")
+        res = fleet.self_update(self.cfg)
+        self.assertTrue(res["pulled"])
+        self.assertEqual(res["installed"], [str(self.installed)])
+        self.assertEqual(self.installed.read_text(), "print('v2')\n")
+
+    def test_dirty_clone_is_left_alone(self):
+        self.write(self.clone, "client/orca-fleet", "print('local edit')\n")
+        res = fleet.self_update(self.cfg)
+        self.assertEqual(res["installed"], [])
+        self.assertTrue(any("uncommitted" in w for w in res["warnings"]))
+        self.assertFalse(self.installed.exists())
+
+    def test_unparsable_client_is_not_installed(self):
+        fleet.self_update(self.cfg)
+        self.write(self.dev, "client/orca-fleet", "def broken(:\n")
+        self.commit(self.dev, "broken")
+        res = fleet.self_update(self.cfg)
+        self.assertTrue(res["pulled"])
+        self.assertTrue(any("not installed orca-fleet" in w for w in res["warnings"]))
+        self.assertEqual(self.installed.read_text(), "print('v1')\n")
+
+    def test_missing_clone_only_warns(self):
+        with mock.patch.object(fleet.os, "getcwd", return_value=str(self.tmp)):
+            res = fleet.self_update({})
+        self.assertIsNone(res["repo"])
+        self.assertTrue(res["warnings"])
+
+    def test_global_flag_never_blocks_the_command(self):
+        env = FakeEnv([FakeServer("a", "1.4.239")])
+        env.cfg["source_repo"] = str(self.tmp / "nope")
+        with mock.patch.object(fleet.os, "getcwd", return_value=str(self.tmp)):
+            rc, out = run(env, ["--self-update", "plan"])
+        self.assertEqual(rc, 0)
+        self.assertIn("skip (already at target)", out)
+
+
 if __name__ == "__main__":
     unittest.main()

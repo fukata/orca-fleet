@@ -725,8 +725,105 @@ def cmd_recover(env: Env, args) -> int:
     return rc
 
 
+# --- self-update (client tool only; the server helper needs root) -------------
+INSTALL_DIR = os.path.expanduser("~/.local/bin")
+SKILL_DIR = os.path.expanduser("~/.claude/skills/orca-fleet")
+
+
+def find_source_repo(cfg: dict, explicit: str | None = None) -> str | None:
+    """The orca-fleet clone: --repo, then config source_repo, then the cwd (automation workspace)."""
+    for cand in (explicit, cfg.get("source_repo"), os.getcwd()):
+        if cand and os.path.isfile(os.path.join(cand, "client", "orca-fleet")) \
+                and os.path.exists(os.path.join(cand, ".git")):
+            return os.path.abspath(cand)
+    return None
+
+
+def install_targets(root: str) -> list[tuple[str, str]]:
+    files = [(os.path.join(root, "client", "orca-fleet"), os.path.join(INSTALL_DIR, "orca-fleet")),
+             (os.path.join(root, "skill", "orca-fleet", "SKILL.md"), os.path.join(SKILL_DIR, "SKILL.md"))]
+    if sys.platform == "win32":
+        files.append((os.path.join(root, "client", "orca-fleet.cmd"), os.path.join(INSTALL_DIR, "orca-fleet.cmd")))
+    return files
+
+
+def self_update(cfg: dict, repo: str | None = None, pull: bool = True) -> dict:
+    """Fast-forward the clone and install the client files that differ.
+
+    Never raises for expected problems (dirty clone, diverged, offline, broken file): they are
+    returned as warnings and the current version keeps running, so updates are never blocked.
+    """
+    out = {"repo": None, "pulled": False, "revision": None, "installed": [], "warnings": []}
+    root = find_source_repo(cfg, repo)
+    if not root:
+        out["warnings"].append("orca-fleet clone not found (set source_repo in config or pass --repo)")
+        return out
+    out["repo"] = root
+
+    def git(*a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True, timeout=120)
+
+    try:
+        if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            out["warnings"].append("clone has uncommitted changes; not pulling or installing")
+            return out
+        before = git("rev-parse", "HEAD").stdout.strip()
+        if pull:
+            cp = git("pull", "--ff-only", "--quiet")
+            if cp.returncode != 0:
+                out["warnings"].append("git pull --ff-only failed: " + (cp.stderr.strip().splitlines() or ["?"])[-1])
+        out["revision"] = git("rev-parse", "--short", "HEAD").stdout.strip()
+        out["pulled"] = git("rev-parse", "HEAD").stdout.strip() != before
+    except (OSError, subprocess.TimeoutExpired) as e:
+        out["warnings"].append(f"git failed: {e}")
+        return out
+
+    for src, dst in install_targets(root):
+        try:
+            with open(src, "rb") as f:
+                new = f.read()
+            try:
+                with open(dst, "rb") as f:
+                    if f.read() == new:
+                        continue
+            except FileNotFoundError:
+                pass
+            if src.endswith(os.path.join("client", "orca-fleet")):
+                compile(new, src, "exec")  # never install a client that cannot even be parsed
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = f"{dst}.tmp-{os.getpid()}"
+            with open(tmp, "wb") as f:
+                f.write(new)
+            os.chmod(tmp, 0o755 if not dst.endswith((".md", ".cmd")) else 0o644)
+            os.replace(tmp, dst)
+            out["installed"].append(dst)
+        except (OSError, SyntaxError, ValueError) as e:
+            out["warnings"].append(f"not installed {os.path.basename(dst)}: {e}")
+    return out
+
+
+def print_self_update(res: dict, stream=None) -> None:
+    stream = stream or sys.stderr
+    state = "updated" if res["pulled"] else "up to date"
+    print(f"self-update: {res['repo'] or '-'} @ {res['revision'] or '-'} ({state}); "
+          f"installed: {', '.join(os.path.basename(p) for p in res['installed']) or 'nothing'}", file=stream)
+    for w in res["warnings"]:
+        print(f"self-update: WARNING: {w}", file=stream)
+
+
+def cmd_self_update(env: Env, args) -> int:
+    res = self_update(env.cfg, args.repo, pull=not args.no_pull)
+    if args.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print_self_update(res, sys.stdout)
+    return 0 if not res["warnings"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orca-fleet", description=__doc__.split("\n")[0])
+    p.add_argument("--self-update", action="store_true",
+                   help="update this tool from its git clone first, then run the command with the new version")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, version=True, mode=False):
@@ -772,6 +869,10 @@ def build_parser() -> argparse.ArgumentParser:
     rc = common(sub.add_parser("recover", help="reconcile an interrupted update"), version=False)
     rc.add_argument("--timeout", type=float, default=900)
     rc.add_argument("--poll", type=float, default=5)
+    su = sub.add_parser("self-update", help="git pull --ff-only the orca-fleet clone and install changed files")
+    su.add_argument("--repo", help="path of the orca-fleet clone (default: config source_repo, then cwd)")
+    su.add_argument("--no-pull", action="store_true", help="only install what the clone already has")
+    su.add_argument("--json", action="store_true")
     return p
 
 
@@ -781,9 +882,17 @@ def main(argv: list[str] | None = None, env: Env | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     env = env or Env(load_config())
+    if args.self_update and args.cmd != "self-update":
+        res = self_update(env.cfg)
+        print_self_update(res)
+        me = os.path.join(INSTALL_DIR, "orca-fleet")
+        if me in res["installed"] and os.path.realpath(sys.argv[0]) == os.path.realpath(me):
+            # this process is the old version: re-run the command with the one just installed
+            rest = [a for a in (sys.argv[1:] if argv is None else argv) if a != "--self-update"]
+            return subprocess.run([sys.executable, me, *rest]).returncode
     handlers = {"discover": cmd_discover, "status": cmd_status, "plan": cmd_plan, "prepare": cmd_prepare,
                 "update": cmd_update, "retry": cmd_retry, "progress": cmd_progress,
-                "rollback": cmd_rollback, "recover": cmd_recover}
+                "rollback": cmd_rollback, "recover": cmd_recover, "self-update": cmd_self_update}
     return handlers[args.cmd](env, args)
 
 
