@@ -209,18 +209,21 @@ class TestUpdater(osu.Updater):
     def __init__(self, *a, daemons=None, **kw):
         super().__init__(*a, **kw)
         self._daemons = daemons if daemons is not None else [{"pid": 4242, "protocol": 48}]
+        self.scopes = ["orca_pty_d_1.scope", "orca_pty_d_2.scope"]   # one per terminal
+        self.scopes_gone_after_update = set()
+        self.dead_after_update = set()      # daemon pids that disappear during the update
+        self._scope_calls = 0
 
     def daemon_processes(self):
         return list(self._daemons)
 
-    sessions = [5001, 5002]       # processes inside orca_pty_* scopes
-    dead_after_update = set()     # pids that disappear during the update
-
-    def pty_session_pids(self):
-        return list(self.sessions)
+    def pty_scopes(self, proc="/proc"):
+        self._scope_calls += 1   # 1st call: before the switch, later: after it
+        gone = self.scopes_gone_after_update if self._scope_calls > 1 else set()
+        return [s for s in self.scopes if s not in gone]
 
     def pids_alive(self, pids):
-        live = ({d["pid"] for d in self._daemons} | set(self.sessions)) - self.dead_after_update
+        live = {d["pid"] for d in self._daemons} - self.dead_after_update
         return [p for p in pids if p in live]
 
 
@@ -509,12 +512,37 @@ class Worker(Base):
         self.assertTrue(st["sessions_preserved"])
         self.assertEqual(st["pty_daemons_replaced"], [4343])
 
-    def test_lost_terminal_process_is_reported(self):
-        self.u.dead_after_update = {5002}
+    def test_lost_terminal_is_reported(self):
+        self.u.scopes_gone_after_update = {"orca_pty_d_2.scope"}
         self.run_worker()
         st = self.state()
         self.assertFalse(st["sessions_preserved"])
+        self.assertEqual(st["pty_sessions_before"], 2)
         self.assertEqual(st["pty_sessions_lost"], 1)
+        self.assertEqual(st["pty_sessions_lost_scopes"], ["orca_pty_d_2.scope"])
+
+    def test_pty_scopes_counts_terminals_not_processes(self):
+        proc = Path(self.tmp) / "proc"
+        uid = os.getuid()
+        cg = "0::/user.slice/user-{0}.slice/user@{0}.service/app.slice/{1}\n"
+        procs = {  # pid -> cgroup leaf; terminal 1 has a shell plus a short-lived child
+            "100": "orca_ptys_orca_daemon_x.slice/orca_pty_orca_daemon_x_1.scope",
+            "101": "orca_ptys_orca_daemon_x.slice/orca_pty_orca_daemon_x_1.scope",
+            "200": "orca_ptys_orca_daemon_x.slice/orca_pty_orca_daemon_x_2.scope",
+            "300": "orca-daemon-x.scope",       # the daemon itself, not a terminal
+            "400": "orca-serve.service",
+        }
+        for pid, leaf in procs.items():
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cgroup").write_text(cg.format(uid, leaf))
+        (proc / "self").mkdir()
+        real = osu.Updater.pty_scopes
+        with mock.patch.object(osu.pwd, "getpwnam", return_value=mock.Mock(pw_uid=uid)):
+            before = real(self.u, proc=str(proc))
+            shutil.rmtree(proc / "101")          # the child exits during the update
+            after = real(self.u, proc=str(proc))
+        self.assertEqual(before, ["orca_pty_orca_daemon_x_1.scope", "orca_pty_orca_daemon_x_2.scope"])
+        self.assertEqual(after, before)
 
     def test_start_failure_rolls_back(self):
         self.sys.fail_start_for = {"1.4.239"}

@@ -531,26 +531,29 @@ class Updater:
     def can_attach(facts: dict, owner_protocol: int) -> bool:
         return owner_protocol == facts["protocol"] or owner_protocol in facts["previous"]
 
-    def pty_session_pids(self) -> list[int]:
-        """PIDs running inside Orca's per-terminal scopes (orca_pty_*.scope) of the service user.
+    def pty_scopes(self, proc: str = "/proc") -> list[str]:
+        """Orca's per-terminal scopes (orca_pty_*.scope) that hold a process of the service user.
 
-        These are the shells/agents users care about. A daemon that owned no terminal may be
-        recycled by Orca on upgrade; that is not a lost session, so survival is judged here.
+        One scope per terminal; it exists while any process in it is alive. Survival is judged
+        per scope, not per PID: short-lived children (sleep, docker ps, ...) exit on their own
+        during an update, and a daemon that owned no terminal may be recycled by Orca.
         """
         uid = pwd.getpwnam(self.config()["service_user"]).pw_uid
-        out = []
-        for name in os.listdir("/proc"):
+        out = set()
+        for name in os.listdir(proc):
             if not name.isdigit():
                 continue
             try:
-                if os.stat(f"/proc/{name}").st_uid != uid:
+                if os.stat(f"{proc}/{name}").st_uid != uid:
                     continue
-                with open(f"/proc/{name}/cgroup", encoding="utf-8", errors="replace") as f:
-                    cg = f.read()
+                with open(f"{proc}/{name}/cgroup", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
             except OSError:
                 continue
-            if "/orca_pty_" in cg:
-                out.append(int(name))
+            for line in lines:
+                leaf = line.rpartition("/")[2]
+                if leaf.startswith("orca_pty_") and leaf.endswith(".scope"):
+                    out.add(leaf)
         return sorted(out)
 
     def pids_alive(self, pids: list[int]) -> list[int]:
@@ -957,9 +960,9 @@ class Updater:
             res = "deferred" if _only_deferrals(report) else "failed"
             return self._finish(st, res, error="; ".join(report["blockers"]))
         daemons = self.pty_daemons()
-        sessions = self.pty_session_pids()
+        scopes = self.pty_scopes()
         st["pty_daemons_before"] = daemons
-        st["pty_sessions_before"] = len(sessions)
+        st["pty_sessions_before"] = len(scopes)
         try:
             self._switch(st, version, arch)
             self._verify(st, version)
@@ -969,8 +972,9 @@ class Updater:
             return self._rollback_after_failure(st, current, arch)
         st["pty_daemons_after"] = self.pids_alive(daemons)
         st["pty_daemons_replaced"] = sorted(set(daemons) - set(st["pty_daemons_after"]))
-        lost = sorted(set(sessions) - set(self.pids_alive(sessions)))
+        lost = sorted(set(scopes) - set(self.pty_scopes()))
         st["pty_sessions_lost"] = len(lost)
+        st["pty_sessions_lost_scopes"] = lost
         st["sessions_preserved"] = not lost
         st["last_success_previous"] = current
         return self._finish(st, "succeeded")
