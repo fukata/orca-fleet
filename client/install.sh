@@ -5,7 +5,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -D -m 0755 "$here/orca-fleet" "$HOME/.local/bin/orca-fleet"
 if [ "${1:-}" != "--no-skill" ]; then
-  install -D -m 0644 "$here/../skill/orca-fleet-update/SKILL.md" "$HOME/.claude/skills/orca-fleet-update/SKILL.md"
+  install -D -m 0644 "$here/../skill/orca-fleet/SKILL.md" "$HOME/.claude/skills/orca-fleet/SKILL.md"
 fi
 echo "installed ~/.local/bin/orca-fleet"
 echo "next: orca-fleet discover            # review"

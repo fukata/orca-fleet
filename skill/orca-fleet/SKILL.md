@@ -1,5 +1,5 @@
 ---
-name: orca-fleet-update
+name: orca-fleet
 description: Check and update the Orca versions of remote `orca serve` servers (paired Orca environments) so they all run the same release. Use when the user asks things like "すべてのOrcaサーバーのバージョンを確認して", "最新安定版に更新できるサーバーを一覧表示して", "すべてのOrcaサーバーを同じバージョンに更新して", "実行中のエージェントがあるサーバーはスキップして", "更新に失敗したサーバーを確認して", "接続しているすべてのOrcaサーバーを最新安定版に揃えて", or asks to roll back / recover an Orca server update.
 ---
 
