@@ -210,8 +210,9 @@ orca-fleet で Orca Remote Server (headless serve) を最新安定版に揃え�
 
 1. \`$HOME/.local/bin/orca-fleet update --yes --wait-idle 1800 --track\` を実行する（SAFE モード）。
 2. 終了後 \`$HOME/.local/bin/orca-fleet status\` を実行する。
-3. 結果を日本語で短く報告する: サーバーごとの 旧→新バージョン と結果（succeeded / skipped / deferred / rolled_back / failed / unverified）。
-   失敗・rolled_back・unverified があれば \`$HOME/.local/bin/orca-fleet progress\` の error を添える。
+3. 結果を日本語で短く報告する。1行目は update 出力の \`outcome:\`（nothing_to_update / updated / deferred / rolled_back / failed）をそのまま書く。
+   続けてサーバーごとの 旧→新バージョン と結果（succeeded / skipped / deferred / rolled_back / failed / unverified）、status の \`fleet:\` 行（ターゲットに揃っていないサーバー）を書く。
+   failed・rolled_back・unverified があれば \`$HOME/.local/bin/orca-fleet progress\` の error を添える。
 
 禁止: \`--mode force\`、\`rollback\`、\`recover\`、設定ファイルやサーバーの手動変更。問題があれば報告だけして終了する。
 EOF
@@ -223,6 +224,7 @@ EOF
 | `plan --needs-action` | 更新対象（update / defer）か要復旧（recover-first）のサーバーがあれば exit 0 で実行します。全台が skip か unreachable なら exit 1 で、その回はスキップされます。 |
 | `--wait-idle 1800` | SAFE で延期されたサーバーについて、最大30分エージェントの終了を待って再試行します。それでも作業中なら次の回に回します。 |
 | `--track` | 各サーバーの結果を Orchestration の Run/Task に記録します。 |
+| `outcome:` / `fleet:` | `update` が最後に出す実行結果の分類と、全サーバーのバージョンのずれです（[README](../README.md#実行結果の判定outcomeと通知)）。Claude の報告とは別に通知したい場合は、設定ファイルの `notify_command` を使います。 |
 | `--missed-run-grace-minutes` | PC がスリープしていて実行時刻を逃した場合に、何分後まで遅れて実行するかです。既定は 720 分（12時間）なので、日中に実行されることがあります。 |
 
 > **コマンドは絶対パスで指定してください。**

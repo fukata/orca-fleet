@@ -174,8 +174,8 @@ server/migrate-to-system-unit.sh  user unit / AppImage の serve を system unit
 server/systemd/…/recommended.conf  任意: RestartPreventExitStatus=3 78
 skill/orca-fleet/SKILL.md   自然言語操作用スキル
 docs/setup-guide.md          別環境への導入ガイド (現状調査 → 移行 → 導入 → automations)
-tests/test_server.py         サーバー側ユニットテスト (49)
-tests/test_client.py         クライアント側ユニットテスト (22)
+tests/test_server.py         サーバー側ユニットテスト (51)
+tests/test_client.py         クライアント側ユニットテスト (28)
 tests/e2e/                   systemd コンテナでの実 .deb E2E
 ```
 
@@ -228,7 +228,8 @@ orca-fleet discover --write    # ~/.config/orca-fleet/config.json
 ## 8. 実行方法
 
 ```bash
-orca-fleet status                       # 全サーバーの状態とバージョン
+orca-fleet status                       # 全サーバーの状態とバージョン、バージョンのずれ (fleet 行)
+orca-fleet status --check               # 全台が到達可能かつターゲット版なら exit 0、ずれがあれば exit 1
 orca-fleet plan [--version 1.4.239]     # 更新計画 (read-only)
 orca-fleet update --dry-run             # 取得予定のみ表示
 orca-fleet update                       # 計画表示 → y/N 承認 → 並列prepare → 1台ずつ更新 → 結果表
@@ -241,12 +242,53 @@ orca-fleet recover --server dev         # 中断した操作の整合
 orca-fleet update --yes --track         # (Orca ターミナル内) Run/Task に記録
 ```
 
+### 実行結果の判定（outcome）と通知
+
+`update` / `retry` は最後に、その回の結果を1語で分類した `outcome` と、全サーバーのバージョン分布（`fleet` 行）を出力します。`--json` の出力にも同じ内容が入ります。
+
+| outcome | 意味 |
+|---|---|
+| `nothing_to_update` | 更新対象のサーバーがない（全台 skip か unreachable） |
+| `updated` | 更新したサーバーがすべて成功した |
+| `deferred` | 失敗はないが、SAFE で延期したサーバーがある |
+| `rolled_back` | 自動ロールバックが発生した（旧版で正常稼働） |
+| `failed` | 上記以外の失敗がある（failed、rollback_failed、prepare_failed、unverified、not_attempted など） |
+
+複数に該当する場合は `failed` → `rolled_back` → `deferred` → `updated` の順に優先します。
+
+```
+outcome: deferred  (succeeded: srv1; deferred: srv2; unreachable: srv3)
+fleet: 1.4.239 x1 (srv1), 1.4.229 x1 (srv2)  -- DRIFT: behind 1.4.239: srv2; version unknown: srv3; not reachable over Orca: srv3
+```
+
+`fleet` 行のバージョンには、Orca 接続で見えるバージョン（クライアントが実際に話している serve のバージョン）を使います。Orca で到達できないときだけ、SSH で取得したインストール済みのバージョンを使います。
+
+設定ファイルに `notify_command`（argv の配列）を書くと、`update` / `retry` が終わるたびにそのコマンドを実行します。`--dry-run` のときと、確認で中止したときは実行しません。コマンドには次のものが渡されます。
+
+- 標準入力: `outcome`、`target`、`servers`（結果ごとのサーバー名）、`fleet`（バージョン分布とずれ）、`errors` を含む JSON
+- 環境変数 `ORCA_FLEET_OUTCOME`
+
+シェルを経由しないので、パイプを使いたい場合はスクリプトを用意します。
+
+```json
+{"notify_command": ["/home/<user>/.local/bin/orca-fleet-notify"]}
+```
+
+```bash
+#!/bin/sh
+# 例: ntfy に送る。成功・更新なしは低優先度にする
+case "$ORCA_FLEET_OUTCOME" in failed|rolled_back) prio=high ;; deferred) prio=default ;; *) prio=low ;; esac
+curl -fsS -H "Title: orca-fleet: $ORCA_FLEET_OUTCOME" -H "Priority: $prio" --data-binary @- https://ntfy.sh/<topic>
+```
+
+automation の precheck（`plan --needs-action`）で全台 skip だった日は `update` 自体が起動しないため、通知は送られません。その日の結果は automation の実行履歴に skipped として残ります。
+
 自然言語で操作する場合は、スキルを入れた Claude（Orca ターミナル内）に、たとえば「接続しているすべてのOrcaサーバーを最新安定版に揃えて」と依頼します。Claude は計画を表示して承認を求め、承認後に `update --yes` を実行して結果の表を返します。
 
 ## 9. テスト
 
 ```bash
-python3 -m unittest discover -s tests -v       # 71 tests
+python3 -m unittest discover -s tests -v       # 79 tests
 ```
 
 ### ユニットテストで扱うケース

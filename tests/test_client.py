@@ -3,6 +3,9 @@
 import importlib.machinery
 import importlib.util
 import io
+import json
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -48,12 +51,16 @@ class FakeEnv(fleet.Env):
         self.max_parallel_prepares = 0
         self.orca_calls = []
         self.tasks = {}
+        self.notifications = []
 
     def releases(self):
         return RELEASES
 
     def sleep(self, s):
         pass
+
+    def notify(self, argv, payload, outcome):
+        self.notifications.append((argv, json.loads(payload), outcome))
 
     def orca(self, args, timeout=45):
         self.orca_calls.append(args)
@@ -143,9 +150,83 @@ class ClientTests(unittest.TestCase):
         rc, out = run(env, ["status"])
         self.assertEqual(rc, 0)
         self.assertIn("target: 1.4.239", out)
-        lines = {l.split()[0]: l for l in out.splitlines()[3:]}
+        lines = {l.split()[0]: l for l in out.splitlines()[3:] if l.strip()}
         self.assertIn("yes", lines["a"])  # needs update
         self.assertRegex(lines["b"], r"1\.4\.239\s+no")
+
+    def test_status_shows_version_drift(self):
+        env = FakeEnv([FakeServer("a"), FakeServer("b", "1.4.239"), FakeServer("c", "1.4.239"), FakeServer("d")])
+        env.servers["d"].ssh_down = True
+        rc, out = run(env, ["status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("fleet: 1.4.239 x2 (b, c), 1.4.229 x1 (a)", out)
+        self.assertIn("behind 1.4.239: a", out)
+        self.assertIn("version unknown: d", out)
+        self.assertIn("not reachable over Orca: d", out)
+        self.assertEqual(run(env, ["status", "--check"])[0], 1)
+        ok = FakeEnv([FakeServer("a", "1.4.239"), FakeServer("b", "1.4.239")])
+        rc, out = run(ok, ["status", "--check"])
+        self.assertEqual(rc, 0)
+        self.assertIn("fleet: all 2 server(s) at 1.4.239", out)
+        self.assertNotIn("DRIFT", out)
+        rc, out = run(env, ["status", "--json"])
+        fl = json.loads(out)["fleet"]
+        self.assertEqual((fl["behind"], fl["consistent"]), (["a"], False))
+
+    def test_drift_prefers_version_seen_over_orca(self):
+        s = FakeServer("a", "1.4.239")
+        s.client_sees = "1.4.229"  # package installed but the running serve is still old
+        rc, out = run(FakeEnv([s]), ["status"])
+        self.assertIn("behind 1.4.239: a", out)
+
+    def test_outcome_and_notify(self):
+        cfg = {"notify_command": ["/bin/notify"]}
+
+        def outcome(servers, argv=("update", "--yes")):
+            env = FakeEnv(servers)
+            env.cfg.update(cfg)
+            rc, out = run(env, list(argv))
+            self.assertEqual(len(env.notifications), 1, out)
+            argv_, payload, oc = env.notifications[0]
+            self.assertEqual((argv_, payload["outcome"]), (["/bin/notify"], oc))
+            self.assertIn(f"outcome: {oc}", out)
+            return oc, payload
+
+        oc, payload = outcome([FakeServer("a", "1.4.239")])
+        self.assertEqual(oc, "nothing_to_update")
+        self.assertEqual(payload["servers"], {"skip": ["a"]})
+        self.assertTrue(payload["fleet"]["consistent"])
+        oc, payload = outcome([FakeServer("a"), FakeServer("b", "1.4.239")])
+        self.assertEqual(oc, "updated")
+        self.assertEqual(payload["servers"], {"succeeded": ["a"], "skip": ["b"]})
+        self.assertTrue(payload["fleet"]["consistent"])
+        oc, payload = outcome([FakeServer("a", busy=1), FakeServer("b")])
+        self.assertEqual(oc, "deferred")
+        self.assertEqual(payload["fleet"]["behind"], ["a"])
+        self.assertEqual(outcome([FakeServer("a", busy=1)])[0], "deferred")  # nothing attempted
+        rb = FakeServer("a")
+        rb.apply_result = "rolled_back"
+        oc, payload = outcome([rb])
+        self.assertEqual((oc, payload["servers"]), ("rolled_back", {"rolled_back": ["a"]}))
+        rb2, bad = FakeServer("a"), FakeServer("b")
+        rb2.apply_result, bad.prepare_fail = "rolled_back", "checksum_mismatch"
+        self.assertEqual(outcome([rb2, bad])[0], "failed")
+
+    def test_no_notify_on_dry_run_or_without_config(self):
+        env = FakeEnv([FakeServer("a")])
+        run(env, ["update", "--yes"])
+        env2 = FakeEnv([FakeServer("a")])
+        env2.cfg["notify_command"] = ["/bin/notify"]
+        run(env2, ["update", "--dry-run"])
+        self.assertEqual(env.notifications + env2.notifications, [])
+
+    def test_notify_command_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            with open(path, "w") as f:
+                json.dump({"notify_command": "curl x | sh", "servers": []}, f)
+            with self.assertRaises(SystemExit):
+                fleet.load_config(path)
 
     def test_plan_classifies_servers(self):
         env = FakeEnv([FakeServer("same", "1.4.239"), FakeServer("old"), FakeServer("busy", busy=1),
