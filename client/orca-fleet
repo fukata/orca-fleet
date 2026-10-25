@@ -353,7 +353,7 @@ def print_plan(target: dict, plan: list[dict], mode: str) -> None:
 
 
 def confirm(args, plan: list[dict]) -> bool:
-    todo = [p["server"] for p in plan if p["action"] == "update"]
+    todo = [p["server"] for p in plan if p["action"].startswith("update")]
     if not todo:
         return False
     if args.yes:
@@ -442,7 +442,12 @@ def cmd_update(env: Env, args, only: list[str] | None = None) -> int:
     if only is not None:
         plan = [p for p in plan if p["server"] in only]
     print_plan(target, plan, args.mode)
-    todo = [p for p in plan if p["action"] == "update"]
+    if getattr(args, "wait_idle", 0):
+        # deferred servers stay in scope: the server re-checks and the wait loop below retries
+        for p in plan:
+            if p["action"].startswith("defer"):
+                p["action"] = "update (wait for idle)"
+    todo = [p for p in plan if p["action"].startswith("update")]
     if not todo:
         print("\nNothing to update.")
         return 0
