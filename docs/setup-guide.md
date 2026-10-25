@@ -225,6 +225,14 @@ EOF
 | `--track` | 各サーバーの結果を Orchestration の Run/Task に記録します。 |
 | `--missed-run-grace-minutes` | PC がスリープしていて実行時刻を逃した場合に、何分後まで遅れて実行するかです。既定は 720 分（12時間）なので、日中に実行されることがあります。 |
 
+> **コマンドは絶対パスで指定してください。**
+> precheck と prompt 内の `orca-fleet` は、Orca 本体の環境変数で実行されます。
+> Linux でデスクトップから起動した Orca（GNOME などのランチャー経由）は、ログインシェルの設定を読まないため、`~/.local/bin` が PATH に入っていないことがあります。
+> その場合、precheck は「コマンドが見つからない」で失敗し、毎回スキップとして記録されます。
+> 例: `--precheck "$HOME/.local/bin/orca-fleet plan --needs-action"`。prompt 内のコマンドも同じパスにそろえます。
+> `$HOME` は作成時のシェルで展開されるので、上のように二重引用符で囲みます。
+> Windows では `orca-fleet.cmd` のフルパス（例: `C:\Users\<user>\.local\bin\orca-fleet.cmd`）を指定します。
+
 作成後の確認です。
 
 ```bash
@@ -233,10 +241,10 @@ orca automations run <id>     # 今すぐ実行する。更新対象があれば
 orca automations runs <id>    # 実行履歴（skipped / 成功 / 失敗）
 ```
 
-初回は手動で `run` して、次の点を確かめてください。
+初回は手動で `run` して、Claude が確認なしでコマンドを実行できるかを確かめてください（ホストのエージェント起動引数の設定によります）。
 
-- precheck のコマンドが PATH から見つかるか
-- Claude が確認なしでコマンドを実行できるか（ホストのエージェント起動引数の設定による）
+- 手動の `run` は precheck を通らずに Claude を起動します。実行履歴では `precheckResult` が `null` になります。
+- precheck が自動化の環境で正しく動くかは、最初の定期実行の履歴で確認します。`precheckResult` を見るか、更新不要の日に skipped と記録されているかを確認してください。
 
 ## 8. つまずきポイント（今回実際に起きたこと）
 
