@@ -599,6 +599,11 @@ class Misc(Base):
         self.assertTrue(st["activity"]["known"])
         self.assertTrue(st["linger"])
 
+    def test_status_ignores_partial_downloads(self):
+        self.u.cmd_prepare("1.4.239")
+        Path(self.paths["cache_dir"], ".dl-abc123.deb").write_bytes(b"partial")
+        self.assertEqual(self.u.cmd_status()["prepared_versions"], ["1.4.229", "1.4.239"])
+
     def test_root_required_for_privileged_commands(self):
         u = osu.Updater(runner=self.sys, http=self.http, paths=self.paths, require_root=True)
         if os.geteuid() != 0:

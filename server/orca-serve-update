@@ -670,8 +670,8 @@ class Updater:
         if st.get("phase") and st.get("result") is None and not out["worker_active"]:
             out["stale_operation"] = True  # crashed mid-update: run `recover`
         try:
-            prepared = sorted(n[len(PACKAGE_NAME) + 1:].split("_")[0]
-                              for n in os.listdir(self.paths["cache_dir"]) if n.endswith(".deb"))
+            prepared = sorted(m.group(1) for n in os.listdir(self.paths["cache_dir"])
+                              if (m := re.fullmatch(rf"{PACKAGE_NAME}_(\d+\.\d+\.\d+)_[a-z0-9]+\.deb", n)))
         except OSError:
             prepared = None  # cache dir is root-only
         out["prepared_versions"] = prepared
