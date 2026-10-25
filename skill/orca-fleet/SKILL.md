@@ -18,6 +18,7 @@ Never run bare `orca` on Linux (GNOME screen reader). The tools use `orca-ide`.
 | Request | Command (read-only unless noted) |
 | --- | --- |
 | バージョンを確認 / status | `orca-fleet status` |
+| バージョンが揃っているか / 未更新のサーバーは | `orca-fleet status` (the `fleet:` line; `--check` exits 1 on drift) |
 | 更新できるサーバーを一覧 | `orca-fleet plan` (add `--version X.Y.Z` for a specific release) |
 | 何が起きるか確認だけ | `orca-fleet update --dry-run` |
 | 同じバージョンに揃えて / 最新安定版に揃えて | plan → approval → `orca-fleet update --yes [--track]` (**mutating**) |
@@ -46,7 +47,9 @@ but survival is not guaranteed.
 
 ## Reporting
 
-After a mutating run, report per server: result (succeeded / skipped / deferred /
+After a mutating run, start with the `outcome:` line it prints (nothing_to_update /
+updated / deferred / rolled_back / failed) and the `fleet:` line (servers whose
+version differs from the target or that Orca cannot reach). Then report per server: result (succeeded / skipped / deferred /
 rolled_back / failed / unverified), versions before → after, and any error. Use
 `orca-fleet progress` for the server-side record if the run output was cut off.
 A `deferred` server is not a failure: say why (agents working, activity unknown,

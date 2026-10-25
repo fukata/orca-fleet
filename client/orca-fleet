@@ -118,6 +118,17 @@ class Env:
     def sleep(self, s: float) -> None:
         time.sleep(s)
 
+    def notify(self, argv: list[str], payload: str, outcome: str) -> None:
+        """Run the configured notify_command with the run summary (JSON) on stdin."""
+        try:
+            cp = subprocess.run(argv, input=payload, text=True, capture_output=True, timeout=60,
+                                env={**os.environ, "ORCA_FLEET_OUTCOME": outcome})
+        except (OSError, subprocess.TimeoutExpired) as e:
+            eprint(f"warning: notify_command failed: {e}")
+            return
+        if cp.returncode != 0:
+            eprint(f"warning: notify_command exited {cp.returncode}: {(cp.stderr or cp.stdout).strip()[-300:]}")
+
 
 # --- config -----------------------------------------------------------------
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -126,6 +137,9 @@ def load_config(path: str = CONFIG_PATH) -> dict:
             cfg = json.load(f)
     except FileNotFoundError:
         return {"servers": []}
+    nc = cfg.get("notify_command")
+    if nc is not None and not (isinstance(nc, list) and nc and all(isinstance(x, str) and x for x in nc)):
+        raise SystemExit("config: notify_command must be a non-empty argv list of strings")
     for s in cfg.get("servers", []):
         for k in ("name", "environment", "ssh"):
             if not NAME_RE.match(str(s.get(k, ""))):
@@ -220,6 +234,49 @@ def summarize(p: dict, target: str | None = None) -> dict:
         row["needs_update"] = vt(installed) != vt(target)
         row["downgrade"] = vt(installed) > vt(target)
     return row
+
+
+def fleet_drift(rows: list[dict], target: str | None) -> dict:
+    """Group servers by the version clients would see, and list those off the target.
+
+    The version reported over the Orca connection wins (that is what a paired Android or
+    desktop client talks to); the installed package is the fallback when Orca can't reach it.
+    """
+    versions: dict[str, list[str]] = {}
+    behind, ahead, unknown, unreachable = [], [], [], []
+    for r in rows:
+        v = r.get("orca_version") or r.get("installed_version")
+        if not r.get("connected"):
+            unreachable.append(r["server"])
+        if not (v and VERSION_RE.match(v)):
+            unknown.append(r["server"])
+            continue
+        versions.setdefault(v, []).append(r["server"])
+        if target and vt(v) < vt(target):
+            behind.append(r["server"])
+        elif target and vt(v) > vt(target):
+            ahead.append(r["server"])
+    return {"target": target, "versions": dict(sorted(versions.items(), key=lambda kv: vt(kv[0]), reverse=True)),
+            "behind": behind, "ahead": ahead, "unknown": unknown, "unreachable": unreachable,
+            "consistent": len(versions) <= 1 and not (behind or ahead or unknown or unreachable)}
+
+
+def drift_line(d: dict) -> str:
+    n = sum(len(v) for v in d["versions"].values()) + len(d["unknown"])
+    if d["consistent"] and d["versions"]:
+        line = f"fleet: all {n} server(s) at {next(iter(d['versions']))}"
+    else:
+        line = "fleet: " + (", ".join(f"{v} x{len(s)} ({', '.join(s)})" for v, s in d["versions"].items()) or "-")
+    parts = []
+    if d["behind"]:
+        parts.append(f"behind {d['target']}: {', '.join(d['behind'])}")
+    if d["ahead"]:
+        parts.append(f"ahead of {d['target']}: {', '.join(d['ahead'])}")
+    if d["unknown"]:
+        parts.append(f"version unknown: {', '.join(d['unknown'])}")
+    if d["unreachable"]:
+        parts.append(f"not reachable over Orca: {', '.join(d['unreachable'])}")
+    return line + ("  -- DRIFT: " + "; ".join(parts) if parts else "")
 
 
 def probe_all(env: Env, servers: list[dict]) -> list[dict]:
@@ -318,14 +375,17 @@ def cmd_status(env: Env, args) -> int:
     except (SystemExit, urllib.error.URLError, OSError) as e:
         eprint(f"warning: cannot resolve target release: {e}")
     rows = [summarize(p, target and target["version"]) for p in probe_all(env, servers)]
+    drift = fleet_drift(rows, target and target["version"])
+    rc = 1 if args.check and not drift["consistent"] else 0
     if args.json:
-        print(json.dumps({"target": target, "servers": rows}, indent=2, ensure_ascii=False))
-        return 0
+        print(json.dumps({"target": target, "servers": rows, "fleet": drift}, indent=2, ensure_ascii=False))
+        return rc
     if target:
         print(f"target: {target['version']} (latest stable {target['latest']}, published {target['published_at']})\n")
     print_table(rows, ["server", "connected", "installed_version", "needs_update", "service",
                        "agents", "busy_agents", "update_state", "error"])
-    return 0
+    print(f"\n{drift_line(drift)}")
+    return rc
 
 
 def build_plan(env: Env, args) -> tuple[dict, list[dict]]:
@@ -433,6 +493,38 @@ def independent_verify(env: Env, server: dict, version: str, attempts: int = 10)
     return {"ok": False, **last}
 
 
+def classify_outcome(plan: list[dict], results: dict[str, dict]) -> str:
+    codes = {v.get("result") for v in results.values()}
+    if codes - {"succeeded", "skipped", "deferred", "rolled_back"}:
+        return "failed"  # failed, rollback_failed, prepare_failed, unverified, unknown, not_attempted, blocked
+    if "rolled_back" in codes:
+        return "rolled_back"
+    if "deferred" in codes or any(p["action"].startswith("defer") for p in plan if p["server"] not in results):
+        return "deferred"
+    return "updated" if "succeeded" in codes else "nothing_to_update"
+
+
+def finish(env: Env, target: str, plan: list[dict], results: dict[str, dict], rows: list[dict]) -> dict:
+    """Print the run's outcome + fleet drift and hand them to notify_command (for automations)."""
+    outcome = classify_outcome(plan, results)
+    by_result: dict[str, list[str]] = {}
+    for name, v in results.items():
+        by_result.setdefault(v.get("result") or "unknown", []).append(name)
+    for p in plan:
+        if p["server"] not in results and not p["action"].startswith("update"):
+            key = p["action"].split(" ")[0]  # skip / defer / unreachable / recover-first
+            by_result.setdefault("deferred" if key == "defer" else key, []).append(p["server"])
+    drift = fleet_drift(rows, target)
+    summary = {"outcome": outcome, "target": target, "servers": by_result, "fleet": drift,
+               "errors": {n: v.get("error") for n, v in results.items() if v.get("error")}}
+    print(f"\noutcome: {outcome}  (" + "; ".join(f"{k}: {', '.join(v)}" for k, v in by_result.items()) + ")")
+    print(drift_line(drift))
+    nc = env.cfg.get("notify_command")
+    if nc:
+        env.notify(nc, json.dumps(summary, ensure_ascii=False), outcome)
+    return summary
+
+
 def cmd_plan(env: Env, args) -> int:
     target, plan = build_plan(env, args)
     if args.json:
@@ -467,6 +559,10 @@ def cmd_update(env: Env, args, only: list[str] | None = None) -> int:
     todo = [p for p in plan if p["action"].startswith("update")]
     if not todo:
         print("\nNothing to update.")
+        if not args.dry_run:
+            summary = finish(env, target["version"], plan, {}, plan)
+            if args.json:
+                print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
     if args.dry_run:
         res = prepare_servers(env, [p["_server"] for p in todo], target["version"], dry_run=True)
@@ -551,8 +647,9 @@ def cmd_update(env: Env, args, only: list[str] | None = None) -> int:
     print_table(final, ["server", "connected", "installed_version", "orca_version", "service", "this_run", "error"])
     if tracker.run_id:
         print(f"\norchestration run: {tracker.run_id}")
+    summary = finish(env, version, plan, results, final)
     if args.json:
-        print(json.dumps({"target": version, "results": results}, indent=2, ensure_ascii=False))
+        print(json.dumps({**summary, "results": results}, indent=2, ensure_ascii=False))
     return 0 if all(v.get("result") in {"succeeded", "skipped", "deferred"} for v in results.values()) else 1
 
 
@@ -644,7 +741,9 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("discover", help="find paired Orca servers via `orca host list`")
     d.add_argument("--write", action="store_true", help=f"write {CONFIG_PATH}")
     d.add_argument("--json", action="store_true")
-    common(sub.add_parser("status", help="versions, service and agent state of every server"))
+    stp = common(sub.add_parser("status", help="versions, service and agent state of every server"))
+    stp.add_argument("--check", action="store_true",
+                     help="exit 1 unless every server is reachable and at the target version")
     pl = common(sub.add_parser("plan", help="show what an update would do (read-only)"), mode=True)
     pl.add_argument("--needs-action", action="store_true",
                     help="exit 0 only if a server needs update or recovery (unreachable/skip -> 1)")
