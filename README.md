@@ -174,8 +174,8 @@ server/migrate-to-system-unit.sh  user unit / AppImage の serve を system unit
 server/systemd/…/recommended.conf  任意: RestartPreventExitStatus=3 78
 skill/orca-fleet/SKILL.md   自然言語操作用スキル
 docs/setup-guide.md          別環境への導入ガイド (現状調査 → 移行 → 導入 → automations)
-tests/test_server.py         サーバー側ユニットテスト (51)
-tests/test_client.py         クライアント側ユニットテスト (28)
+tests/test_server.py         サーバー側ユニットテスト (52)
+tests/test_client.py         クライアント側ユニットテスト (33)
 tests/e2e/                   systemd コンテナでの実 .deb E2E
 ```
 
@@ -306,7 +306,7 @@ automation の precheck（`plan --needs-action`）で全台 skip だった日は
 ## 9. テスト
 
 ```bash
-python3 -m unittest discover -s tests -v       # 84 tests
+python3 -m unittest discover -s tests -v       # 85 tests
 ```
 
 ### ユニットテストで扱うケース
