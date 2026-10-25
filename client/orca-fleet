@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""orca-fleet: check and update every remote `orca serve` to one Orca version.
+
+Discovery uses Orca itself (`orca-ide host list --json`, `orca-ide status
+--environment <name> --json`). Server-side work goes through SSH to the
+`orca-serve-update` helper, which hands the package switch to a transient
+systemd unit so it survives the restart of the very `orca serve` that a client
+may be connected through. Results are verified twice: by the server helper and
+independently from this client over the Orca connection.
+
+Optionally (--track) every server becomes a Task in an Orca orchestration Run,
+so the rollout's state is durable and visible to the coordinator/inbox.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION_RE = re.compile(r"^(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})\Z")
+STABLE_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)\Z")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,100}\Z")
+GITHUB_RELEASES = "https://api.github.com/repos/stablyai/orca/releases?per_page=40"
+HELPER = "/usr/local/sbin/orca-serve-update"
+CONFIG_PATH = os.environ.get("ORCA_FLEET_CONFIG") or os.path.expanduser("~/.config/orca-fleet/config.json")
+TERMINAL = {"succeeded", "skipped", "deferred", "rolled_back", "failed", "rollback_failed"}
+
+
+def vt(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.split("."))
+
+
+def eprint(*a) -> None:
+    print(*a, file=sys.stderr, flush=True)
+
+
+# --- local Orca CLI ---------------------------------------------------------
+def resolve_orca_cli(cfg: dict) -> str:
+    """Never fall back to bare `orca` on Linux: that is the GNOME screen reader."""
+    cand = os.environ.get("ORCA_CLI_COMMAND") or cfg.get("orca_cli") or "orca-ide"
+    path = shutil.which(cand)
+    if not path:
+        raise SystemExit(f"Orca CLI {cand!r} not found (set orca_cli in {CONFIG_PATH})")
+    if os.path.realpath(path) == "/usr/bin/orca":
+        raise SystemExit("refusing to run /usr/bin/orca (GNOME screen reader); use orca-ide")
+    return path
+
+
+class Env:
+    """Side-effect boundary (subprocess + HTTP), replaceable in tests."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._cli: str | None = None
+
+    @property
+    def cli(self) -> str:
+        if self._cli is None:
+            self._cli = resolve_orca_cli(self.cfg)
+        return self._cli
+
+    def orca(self, args: list[str], timeout: float = 45) -> dict:
+        try:
+            cp = subprocess.run([self.cli, *args, "--json"], capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": {"code": "timeout", "message": f"orca {' '.join(args)} timed out"}}
+        try:
+            return json.loads(cp.stdout)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": {"code": "bad_output", "message": (cp.stderr or cp.stdout)[:300]}}
+
+    def ssh_helper(self, server: dict, args: list[str], sudo: bool, timeout: float = 900) -> dict:
+        host = server["ssh"]
+        if not NAME_RE.match(host) or host.startswith("-"):
+            return {"ok": False, "error": {"code": "bad_host", "message": f"invalid ssh host {host!r}"}}
+        remote = " ".join(shlex.quote(x) for x in (["sudo", "-n"] if sudo else []) + [HELPER, "--json", *args])
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=4", "-o", "ClearAllForwardings=yes", host, "--", remote]
+        try:
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": {"code": "ssh_timeout", "message": "ssh timed out"}}
+        line = next((l for l in reversed(cp.stdout.strip().splitlines()) if l.startswith("{")), "")
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            msg = (cp.stderr or cp.stdout).strip()[-400:]
+            code = "ssh_failed" if cp.returncode == 255 else "helper_failed"
+            if "a password is required" in msg or "not allowed" in msg:
+                code = "sudo_denied"
+            if "No such file" in msg or "not found" in msg:
+                code = "helper_missing"
+            return {"ok": False, "error": {"code": code, "message": msg or f"exit {cp.returncode}"}}
+
+    def releases(self) -> list:
+        req = urllib.request.Request(GITHUB_RELEASES, headers={"Accept": "application/vnd.github+json",
+                                                               "User-Agent": "orca-fleet"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def sleep(self, s: float) -> None:
+        time.sleep(s)
+
+
+# --- config -----------------------------------------------------------------
+def load_config(path: str = CONFIG_PATH) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        return {"servers": []}
+    for s in cfg.get("servers", []):
+        for k in ("name", "environment", "ssh"):
+            if not NAME_RE.match(str(s.get(k, ""))):
+                raise SystemExit(f"config: invalid {k} {s.get(k)!r}")
+    return cfg
+
+
+def save_config(cfg: dict, path: str = CONFIG_PATH) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def select_servers(cfg: dict, names: list[str] | None) -> list[dict]:
+    servers = [s for s in cfg.get("servers", []) if s.get("enabled", True)]
+    if names:
+        known = {s["name"] for s in cfg.get("servers", [])}
+        bad = [n for n in names if n not in known]
+        if bad:
+            raise SystemExit(f"unknown server(s): {', '.join(bad)}")
+        servers = [s for s in cfg["servers"] if s["name"] in names]
+    # control host (where the coordinator runs) goes last so it is updated after the rest
+    return sorted(servers, key=lambda s: (bool(s.get("control")), s.get("order", 100), s["name"]))
+
+
+# --- release resolution -----------------------------------------------------
+def resolve_target(env: Env, version: str) -> dict:
+    rels = env.releases()
+    stable = {}
+    for r in rels:
+        m = STABLE_TAG_RE.match(r.get("tag_name", ""))
+        if m and VERSION_RE.match(m.group(1)) and not r.get("prerelease") and not r.get("draft"):
+            stable[m.group(1)] = r
+    if not stable:
+        raise SystemExit("no stable Orca release found on GitHub")
+    latest = max(stable, key=vt)
+    if version == "latest":
+        return {"version": latest, "latest": latest, "published_at": stable[latest].get("published_at")}
+    if not VERSION_RE.match(version):
+        raise SystemExit(f"invalid version {version!r}")
+    if version not in stable:
+        raise SystemExit(f"{version} is not a stable official release (prereleases are refused)")
+    return {"version": version, "latest": latest, "published_at": stable[version].get("published_at")}
+
+
+# --- per-server probes ------------------------------------------------------
+def probe(env: Env, server: dict) -> dict:
+    """Independent views: Orca connection (client side) + helper status (SSH)."""
+    st = env.orca(["status", "--environment", server["environment"]])
+    orca_view = {"reachable": False}
+    if st.get("ok"):
+        rt = st.get("result", {}).get("runtime", {})
+        orca_view = {"reachable": bool(rt.get("reachable")), "version": rt.get("appVersion"),
+                     "state": rt.get("state"), "install_mode": (rt.get("remoteUpdateSupport") or {}).get("installMode")}
+    else:
+        orca_view["error"] = (st.get("error") or {}).get("message")
+    return {"server": server["name"], "orca": orca_view, "helper": helper_status(env, server)}
+
+
+def helper_status(env: Env, server: dict, timeout: float = 90) -> dict:
+    """Prefer root status (sees agents even when the SSH user is not the service user)."""
+    r = env.ssh_helper(server, ["status"], sudo=True, timeout=timeout)
+    if not r.get("ok") and (r.get("error") or {}).get("code") in {"sudo_denied", "helper_failed"}:
+        r = env.ssh_helper(server, ["status"], sudo=False, timeout=timeout)
+    return r
+
+
+def summarize(p: dict, target: str | None = None) -> dict:
+    h = p["helper"] if p["helper"].get("ok") else {}
+    svc = h.get("service") or {}
+    act = h.get("activity") or {}
+    state = h.get("state") or {}
+    installed = h.get("installed_version") or p["orca"].get("version")
+    row = {
+        "server": p["server"],
+        "connected": p["orca"]["reachable"],
+        "ssh": bool(h),
+        "orca_version": p["orca"].get("version"),
+        "installed_version": installed,
+        "service": f"{svc.get('ActiveState', '?')}/{svc.get('SubState', '?')}" if svc else "?",
+        "agents": act.get("agents") if act.get("known") else None,
+        "busy_agents": len(act.get("busy", [])) if act.get("known") else None,
+        "update_state": (f"{state.get('op')}:{state.get('result') or state.get('phase')}" if state.get("op_id") else "-"),
+        "worker_active": h.get("worker_active"),
+        "stale_operation": h.get("stale_operation", False),
+        "error": None if h else (p["helper"].get("error") or {}).get("code"),
+    }
+    if target and installed and VERSION_RE.match(installed):
+        row["needs_update"] = vt(installed) != vt(target)
+        row["downgrade"] = vt(installed) > vt(target)
+    return row
+
+
+def probe_all(env: Env, servers: list[dict]) -> list[dict]:
+    with cf.ThreadPoolExecutor(max_workers=max(1, min(8, len(servers)))) as ex:
+        return list(ex.map(lambda s: probe(env, s), servers))
+
+
+def print_table(rows: list[dict], cols: list[str]) -> None:
+    def fmt(v):
+        return "-" if v is None else ("yes" if v is True else "no" if v is False else str(v))
+    widths = {c: max(len(c), *(len(fmt(r.get(c))) for r in rows)) for c in cols} if rows else {}
+    print("  ".join(c.upper().ljust(widths[c]) for c in cols))
+    for r in rows:
+        print("  ".join(fmt(r.get(c)).ljust(widths[c]) for c in cols))
+
+
+# --- orchestration tracking (optional) -------------------------------------
+class Tracker:
+    """Mirror per-server progress into an Orca orchestration Run as Tasks."""
+
+    def __init__(self, env: Env, enabled: bool, objective: str):
+        self.env, self.enabled, self.tasks = env, enabled, {}
+        self.run_id = None
+        if not enabled:
+            return
+        r = env.orca(["orchestration", "run-create", "--objective", objective])
+        if not r.get("ok"):
+            eprint(f"warning: orchestration tracking disabled: {(r.get('error') or {}).get('message')}")
+            self.enabled = False
+            return
+        res = r.get("result", {})
+        self.run_id = (res.get("run") or {}).get("id") or res.get("id") or res.get("runId")
+
+    def task(self, server: str, spec: str) -> None:
+        if not self.enabled:
+            return
+        args = ["orchestration", "task-create", "--spec", spec, "--task-title", f"update {server}"]
+        if self.run_id:
+            args += ["--run", self.run_id]
+        r = self.env.orca(args)
+        res = r.get("result", {}) if r.get("ok") else {}
+        tid = (res.get("task") or {}).get("id") or res.get("id") or res.get("taskId")
+        if tid:
+            self.tasks[server] = tid
+
+    def update(self, server: str, status: str, result: str) -> None:
+        tid = self.tasks.get(server)
+        if not (self.enabled and tid):
+            return
+        args = ["orchestration", "task-update", "--id", tid, "--status", status, "--result", result[:2000]]
+        if self.run_id:
+            args += ["--run", self.run_id]
+        self.env.orca(args)
+
+
+# --- commands ---------------------------------------------------------------
+def cmd_discover(env: Env, args) -> int:
+    cfg = env.cfg
+    hl = env.orca(["host", "list"])
+    if not hl.get("ok"):
+        raise SystemExit(f"orca host list failed: {hl.get('error')}")
+    known = {s["environment"]: s for s in cfg.get("servers", [])}
+    found = []
+    for h in hl["result"]["hosts"]:
+        if h.get("kind") != "environment" or not NAME_RE.match(h.get("name", "")):
+            continue
+        st = env.orca(["status", "--environment", h["name"]])
+        rt = st.get("result", {}).get("runtime", {}) if st.get("ok") else {}
+        mode = (rt.get("remoteUpdateSupport") or {}).get("installMode")
+        entry = known.get(h["name"]) or {"name": h["name"], "environment": h["name"], "ssh": h["name"]}
+        headless = mode == "unsupported-headless-serve"
+        entry.setdefault("enabled", headless)
+        found.append({**entry, "_reachable": bool(rt.get("reachable")), "_version": rt.get("appVersion"),
+                      "_install_mode": mode, "_headless_serve": headless})
+    rows = [{"server": f["name"], "reachable": f["_reachable"], "version": f["_version"],
+             "headless_serve": f["_headless_serve"] if f["_reachable"] else None,
+             "enabled": f["enabled"], "ssh": f["ssh"]} for f in found]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        print_table(rows, ["server", "reachable", "version", "headless_serve", "enabled", "ssh"])
+        print("\n(unreachable or desktop environments are listed but disabled; edit "
+              f"{CONFIG_PATH} to change ssh host / enabled / control)")
+    if args.write:
+        cfg["servers"] = [{k: v for k, v in f.items() if not k.startswith("_")} for f in found]
+        save_config(cfg)
+        print(f"wrote {CONFIG_PATH}")
+    return 0
+
+
+def cmd_status(env: Env, args) -> int:
+    servers = select_servers(env.cfg, args.server)
+    target = None
+    try:
+        target = resolve_target(env, args.version)
+    except (SystemExit, urllib.error.URLError, OSError) as e:
+        eprint(f"warning: cannot resolve target release: {e}")
+    rows = [summarize(p, target and target["version"]) for p in probe_all(env, servers)]
+    if args.json:
+        print(json.dumps({"target": target, "servers": rows}, indent=2, ensure_ascii=False))
+        return 0
+    if target:
+        print(f"target: {target['version']} (latest stable {target['latest']}, published {target['published_at']})\n")
+    print_table(rows, ["server", "connected", "installed_version", "needs_update", "service",
+                       "agents", "busy_agents", "update_state", "error"])
+    return 0
+
+
+def build_plan(env: Env, args) -> tuple[dict, list[dict]]:
+    target = resolve_target(env, args.version)
+    servers = select_servers(env.cfg, args.server)
+    plan = []
+    for s, p in zip(servers, probe_all(env, servers)):
+        row = summarize(p, target["version"])
+        if row["error"]:
+            action = f"unreachable ({row['error']})"
+        elif row.get("stale_operation"):
+            action = "recover-first"
+        elif not row.get("needs_update", True):
+            action = "skip (already at target)"
+        elif row.get("downgrade") and not getattr(args, "allow_downgrade", False):
+            action = "skip (would downgrade; pass --allow-downgrade)"
+        elif row["busy_agents"] and args.mode == "safe":
+            action = "defer (agents active; SAFE)"
+        elif row["busy_agents"] is None and args.mode == "safe":
+            action = "defer (activity unknown; SAFE)"
+        else:
+            action = "update"
+        plan.append({**row, "action": action, "_server": s})
+    return target, plan
+
+
+def print_plan(target: dict, plan: list[dict], mode: str) -> None:
+    print(f"Target version: {target['version']}  (latest stable: {target['latest']})  mode: {mode.upper()}\n")
+    print_table(plan, ["server", "installed_version", "service", "agents", "busy_agents", "action"])
+    print("\nOrder: downloads run in parallel; restarts run one server at a time "
+          "(control host last); a failure stops the rollout.")
+
+
+def confirm(args, plan: list[dict]) -> bool:
+    todo = [p["server"] for p in plan if p["action"] == "update"]
+    if not todo:
+        return False
+    if args.yes:
+        if args.mode == "force" and not args.i_understand_force:
+            raise SystemExit("FORCE with --yes also needs --i-understand-force")
+        return True
+    if not sys.stdin.isatty():
+        raise SystemExit("refusing to update without confirmation (no TTY); re-run with --yes after review")
+    if args.mode == "force":
+        print("\nWARNING: FORCE restarts orca serve even while agents are working. Terminals live in a "
+              "separate daemon and usually survive, but this is NOT guaranteed across versions.")
+        ans = input(f"Type FORCE to update {', '.join(todo)}: ")
+        return ans.strip() == "FORCE"
+    ans = input(f"\nUpdate {', '.join(todo)}? [y/N] ")
+    return ans.strip().lower() in {"y", "yes"}
+
+
+def prepare_servers(env: Env, servers: list[dict], version: str, dry_run: bool) -> dict[str, dict]:
+    extra = ["--dry-run"] if dry_run else []
+
+    def one(s):
+        return s["name"], env.ssh_helper(s, ["prepare", "--version", version, *extra], sudo=True, timeout=1800)
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, min(8, len(servers)))) as ex:
+        return dict(ex.map(one, servers))
+
+
+def wait_for_op(env: Env, server: dict, op_id: str, timeout: float, poll: float) -> dict:
+    """Poll the server-side state until the op finishes. Disconnects are expected."""
+    deadline = time.monotonic() + timeout
+    last_phase, misses = None, 0
+    while time.monotonic() < deadline:
+        r = helper_status(env, server, timeout=60)
+        if r.get("ok"):
+            misses = 0
+            st = r.get("state") or {}
+            if st.get("op_id") == op_id:
+                if st.get("phase") != last_phase:
+                    last_phase = st.get("phase")
+                    print(f"  [{server['name']}] phase: {last_phase}", flush=True)
+                if st.get("result") in TERMINAL:
+                    return st
+            elif not r.get("worker_active") and st.get("op_id") != op_id and misses > 3:
+                return {"result": "failed", "error": "worker vanished before recording state"}
+        else:
+            misses += 1
+            print(f"  [{server['name']}] waiting (no contact: {(r.get('error') or {}).get('code')})", flush=True)
+        env.sleep(poll)
+    return {"result": "unknown", "error": f"no final result within {int(timeout)}s; check `orca-fleet progress`"}
+
+
+def independent_verify(env: Env, server: dict, version: str, attempts: int = 10) -> dict:
+    """Client-side reconnect over Orca: the server must answer with the target version."""
+    last = {}
+    for _ in range(attempts):
+        st = env.orca(["status", "--environment", server["environment"]])
+        rt = st.get("result", {}).get("runtime", {}) if st.get("ok") else {}
+        last = {"reachable": bool(rt.get("reachable")), "version": rt.get("appVersion"), "state": rt.get("state")}
+        if last["reachable"] and last["state"] == "ready" and last["version"] == version:
+            return {"ok": True, **last}
+        env.sleep(5)
+    return {"ok": False, **last}
+
+
+def cmd_plan(env: Env, args) -> int:
+    target, plan = build_plan(env, args)
+    if args.json:
+        print(json.dumps({"target": target, "plan": [{k: v for k, v in p.items() if k != "_server"}
+                                                       for p in plan]}, indent=2, ensure_ascii=False))
+    else:
+        print_plan(target, plan, args.mode)
+    return 0
+
+
+def cmd_prepare(env: Env, args) -> int:
+    target = resolve_target(env, args.version)
+    servers = select_servers(env.cfg, args.server)
+    res = prepare_servers(env, servers, target["version"], args.dry_run)
+    out = {n: (r if args.json else ("ok" if r.get("ok") else f"FAILED {r.get('error')}")) for n, r in res.items()}
+    print(json.dumps({"target": target["version"], "results": out}, indent=2, ensure_ascii=False))
+    return 0 if all(r.get("ok") for r in res.values()) else 1
+
+
+def cmd_update(env: Env, args, only: list[str] | None = None) -> int:
+    target, plan = build_plan(env, args)
+    if only is not None:
+        plan = [p for p in plan if p["server"] in only]
+    print_plan(target, plan, args.mode)
+    todo = [p for p in plan if p["action"] == "update"]
+    if not todo:
+        print("\nNothing to update.")
+        return 0
+    if args.dry_run:
+        res = prepare_servers(env, [p["_server"] for p in todo], target["version"], dry_run=True)
+        print("\nDRY RUN — prepare would fetch:")
+        for n, r in res.items():
+            print(f"  {n}: {r.get('would_fetch') if r.get('ok') else r.get('error')}")
+        return 0
+    if not confirm(args, plan):
+        print("Aborted; nothing changed.")
+        return 1
+    version = target["version"]
+    tracker = Tracker(env, args.track, f"Update orca serve on {len(todo)} server(s) to {version}")
+    for p in todo:
+        tracker.task(p["server"], f"Update orca serve on {p['server']} from {p['installed_version']} to {version} "
+                                  f"(mode {args.mode}); verify service, runtime and version; roll back on failure.")
+
+    print(f"\n== Prepare (parallel) → {version}")
+    for p in todo:
+        tracker.update(p["server"], "dispatched", "preparing")
+    prep = prepare_servers(env, [p["_server"] for p in todo], version, dry_run=False)
+    results: dict[str, dict] = {}
+    ready = []
+    for p in todo:
+        r = prep[p["server"]]
+        if r.get("ok"):
+            print(f"  {p['server']}: prepared")
+            ready.append(p)
+        else:
+            results[p["server"]] = {"result": "prepare_failed", "error": r.get("error")}
+            print(f"  {p['server']}: PREPARE FAILED {r.get('error')}")
+            tracker.update(p["server"], "failed", f"prepare failed: {r.get('error')}")
+
+    print("\n== Update (one server at a time)")
+    stop = False
+    for p in ready:
+        name, server = p["server"], p["_server"]
+        if stop:
+            results[name] = {"result": "not_attempted", "error": "rollout stopped after an earlier failure"}
+            tracker.update(name, "blocked", "rollout stopped after an earlier failure")
+            continue
+        apply_args = ["apply", "--version", version, "--mode", args.mode]
+        if getattr(args, "allow_downgrade", False):
+            apply_args.append("--allow-downgrade")
+        r = env.ssh_helper(server, apply_args, sudo=True, timeout=120)
+        waited_until = time.monotonic() + max(0.0, getattr(args, "wait_idle", 0) or 0)
+        while r.get("ok") and r.get("result") == "deferred" and time.monotonic() < waited_until:
+            print(f"  {name}: deferred ({'; '.join(r.get('deferrals') or [])}); re-checking in 60s", flush=True)
+            env.sleep(60)
+            r = env.ssh_helper(server, apply_args, sudo=True, timeout=120)
+        if not r.get("ok") or r.get("result") != "started":
+            res = r.get("result") or "failed"
+            results[name] = {"result": res, "error": r.get("error") or r.get("blockers"),
+                             "warnings": r.get("warnings")}
+            print(f"  {name}: {res} {results[name]['error'] or ''}")
+            tracker.update(name, "blocked" if res in {"deferred", "blocked"} else
+                           "completed" if res == "skipped" else "failed", json.dumps(results[name])[:500])
+            if res not in {"deferred", "skipped"} and not args.continue_on_error:
+                stop = True
+            continue
+        print(f"  {name}: worker {r['unit']} started (op {r['op_id']})")
+        st = wait_for_op(env, server, r["op_id"], timeout=args.timeout, poll=args.poll)
+        verdict = {"result": st.get("result"), "error": st.get("error") or st.get("rollback_error"),
+                   "sessions_preserved": st.get("sessions_preserved")}
+        if st.get("result") == "succeeded":
+            iv = independent_verify(env, server, version)
+            verdict["client_verify"] = iv
+            if not iv["ok"]:
+                verdict["result"] = "unverified"
+                verdict["error"] = f"server reports success but client sees {iv}"
+        results[name] = verdict
+        print(f"  {name}: {verdict['result']}" + (f" — {verdict['error']}" if verdict.get("error") else ""))
+        ok = verdict["result"] == "succeeded"
+        tracker.update(name, "completed" if ok else "blocked" if verdict["result"] == "deferred" else "failed",
+                       json.dumps(verdict, ensure_ascii=False)[:1500])
+        if not ok and verdict["result"] != "deferred" and not args.continue_on_error:
+            stop = True
+
+    print("\n== Result")
+    final = [summarize(p, version) for p in probe_all(env, [p["_server"] for p in plan])]
+    for row in final:
+        row["this_run"] = (results.get(row["server"]) or {}).get("result", "-")
+    print_table(final, ["server", "connected", "installed_version", "orca_version", "service", "this_run", "error"])
+    if tracker.run_id:
+        print(f"\norchestration run: {tracker.run_id}")
+    if args.json:
+        print(json.dumps({"target": version, "results": results}, indent=2, ensure_ascii=False))
+    return 0 if all(v.get("result") in {"succeeded", "skipped", "deferred"} for v in results.values()) else 1
+
+
+def cmd_progress(env: Env, args) -> int:
+    servers = select_servers(env.cfg, args.server)
+    out = []
+    for p in probe_all(env, servers):
+        h = p["helper"]
+        st = (h.get("state") or {}) if h.get("ok") else {}
+        out.append({"server": p["server"], "op": st.get("op"), "op_id": st.get("op_id"),
+                    "target": st.get("target"), "previous": st.get("previous"), "phase": st.get("phase"),
+                    "result": st.get("result"), "error": st.get("error") or st.get("rollback_error"),
+                    "worker_active": h.get("worker_active"), "stale": h.get("stale_operation"),
+                    "finished_at": st.get("finished_at"),
+                    "contact": None if h.get("ok") else (h.get("error") or {}).get("code")})
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    else:
+        print_table(out, ["server", "op", "target", "previous", "phase", "result", "worker_active",
+                          "stale", "finished_at", "error", "contact"])
+    return 0
+
+
+def cmd_retry(env: Env, args) -> int:
+    servers = select_servers(env.cfg, args.server)
+    failed = []
+    for p in probe_all(env, servers):
+        st = (p["helper"].get("state") or {}) if p["helper"].get("ok") else {}
+        if st.get("result") in {"failed", "rolled_back", "rollback_failed", "deferred"}:
+            failed.append(p["server"])
+    if not failed:
+        print("No failed/deferred servers to retry.")
+        return 0
+    print(f"Retrying: {', '.join(failed)}")
+    return cmd_update(env, args, only=failed)
+
+
+def cmd_rollback(env: Env, args) -> int:
+    servers = select_servers(env.cfg, args.server)
+    if len(servers) != 1:
+        raise SystemExit("rollback needs exactly one --server")
+    s = servers[0]
+    extra = ["--to", args.to] if args.to else []
+    r = env.ssh_helper(s, ["rollback", *extra, "--dry-run"], sudo=True, timeout=120)
+    if not r.get("ok"):
+        raise SystemExit(f"rollback not possible: {r.get('error')}")
+    print(f"{s['name']}: {r.get('installed_version')} -> {r.get('rollback_to')} (restarts orca serve)")
+    if args.dry_run:
+        return 0
+    if not args.yes and (not sys.stdin.isatty() or input("Proceed? [y/N] ").strip().lower() not in {"y", "yes"}):
+        print("Aborted.")
+        return 1
+    r = env.ssh_helper(s, ["rollback", *extra], sudo=True, timeout=120)
+    if not r.get("ok"):
+        raise SystemExit(f"rollback failed to start: {r.get('error')}")
+    st = wait_for_op(env, s, r["op_id"], timeout=args.timeout, poll=args.poll)
+    iv = independent_verify(env, s, r["target"]) if st.get("result") == "succeeded" else None
+    print(json.dumps({"server": s["name"], "result": st.get("result"), "error": st.get("error"),
+                      "client_verify": iv}, indent=2))
+    return 0 if st.get("result") == "succeeded" and iv and iv["ok"] else 1
+
+
+def cmd_recover(env: Env, args) -> int:
+    servers = select_servers(env.cfg, args.server)
+    rc = 0
+    for s in servers:
+        r = env.ssh_helper(s, ["recover"], sudo=True, timeout=120)
+        print(f"{s['name']}: {r.get('result') or r.get('error')}")
+        if r.get("result") == "started":
+            st = wait_for_op(env, s, r["op_id"], timeout=args.timeout, poll=args.poll)
+            print(f"  -> {st.get('result')} {st.get('error') or ''}")
+            rc |= 0 if st.get("result") in {"succeeded", "rolled_back"} else 1
+    return rc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="orca-fleet", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp, version=True, mode=False):
+        sp.add_argument("--server", action="append", help="limit to server name (repeatable)")
+        sp.add_argument("--json", action="store_true")
+        if version:
+            sp.add_argument("--version", default="latest", help="latest (stable) or X.Y.Z")
+        if mode:
+            sp.add_argument("--mode", choices=["safe", "force"], default="safe")
+        return sp
+
+    d = sub.add_parser("discover", help="find paired Orca servers via `orca host list`")
+    d.add_argument("--write", action="store_true", help=f"write {CONFIG_PATH}")
+    d.add_argument("--json", action="store_true")
+    common(sub.add_parser("status", help="versions, service and agent state of every server"))
+    common(sub.add_parser("plan", help="show what an update would do (read-only)"), mode=True)
+    pr = common(sub.add_parser("prepare", help="download + verify packages on servers in parallel"))
+    pr.add_argument("--dry-run", action="store_true")
+    for name in ("update", "retry"):
+        u = common(sub.add_parser(name, help="update servers to one version" if name == "update"
+                                  else "re-run the update on failed/deferred servers"), mode=True)
+        u.add_argument("--dry-run", action="store_true")
+        u.add_argument("--yes", action="store_true", help="skip the interactive confirmation")
+        u.add_argument("--i-understand-force", action="store_true")
+        u.add_argument("--allow-downgrade", action="store_true")
+        u.add_argument("--continue-on-error", action="store_true")
+        u.add_argument("--wait-idle", type=float, default=0, metavar="SECONDS",
+                       help="SAFE: keep re-checking a deferred server for up to SECONDS")
+        u.add_argument("--track", action="store_true", help="record progress as Orca orchestration Tasks")
+        u.add_argument("--timeout", type=float, default=900)
+        u.add_argument("--poll", type=float, default=5)
+    common(sub.add_parser("progress", help="server-side state of the last update operation"), version=False)
+    rb = common(sub.add_parser("rollback", help="return one server to its previous version"), version=False)
+    rb.add_argument("--to")
+    rb.add_argument("--dry-run", action="store_true")
+    rb.add_argument("--yes", action="store_true")
+    rb.add_argument("--timeout", type=float, default=900)
+    rb.add_argument("--poll", type=float, default=5)
+    rc = common(sub.add_parser("recover", help="reconcile an interrupted update"), version=False)
+    rc.add_argument("--timeout", type=float, default=900)
+    rc.add_argument("--poll", type=float, default=5)
+    return p
+
+
+def main(argv: list[str] | None = None, env: Env | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    env = env or Env(load_config())
+    handlers = {"discover": cmd_discover, "status": cmd_status, "plan": cmd_plan, "prepare": cmd_prepare,
+                "update": cmd_update, "retry": cmd_retry, "progress": cmd_progress,
+                "rollback": cmd_rollback, "recover": cmd_recover}
+    return handlers[args.cmd](env, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
