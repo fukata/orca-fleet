@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import types
@@ -110,6 +111,7 @@ class FakeSystem(osu.Runner):
         self.spawned = []
         self.calls = []
         self._stable_checks = 0
+        self.selftest = (0, '{"ok": true}')   # (rc, stdout) of a new helper's `--json status`
 
     def cp(self, out="", rc=0, err=""):
         return subprocess.CompletedProcess([], rc, out, err)
@@ -120,6 +122,9 @@ class FakeSystem(osu.Runner):
         if a[:1] == ["runuser"]:
             a = a[a.index("--") + 1:]
         cmd = a[0]
+        if cmd == sys.executable and a[-2:] == ["--json", "status"]:
+            rc, out = self.selftest
+            return self.cp(out, rc)
         if cmd == "dpkg" and a[1] == "--print-architecture":
             return self.cp(ARCH + "\n")
         if cmd == "dpkg-query" and a[1] == "-W":
@@ -667,6 +672,97 @@ class Misc(Base):
     def test_apply_latest_rejected(self):
         rc = osu.main(["--json", "apply", "--version", "latest"], updater=self.u)
         self.assertEqual(rc, 2)
+
+
+class HelperSelfUpdate(Base):
+    COMMIT = "a" * 40
+    OLD = b"print('old helper')\n"
+
+    def setUp(self):
+        super().setUp()
+        self.paths["self"] = self.u.paths["self"] = f"{self.tmp}/sbin/orca-serve-update"
+        os.makedirs(os.path.dirname(self.paths["self"]))
+        Path(self.paths["self"]).write_bytes(self.OLD)
+        os.makedirs(self.paths["state_dir"], exist_ok=True)
+        self.set_source({"repo": "fukata/orca-fleet", "ref": "main"})
+        self.remote = b"print('new helper')\n"
+        self.urls = []
+        base_get = self.http.get_json
+
+        def get_json(url, timeout=30):
+            osu._check_url(url)
+            self.urls.append(url)
+            if url == "https://api.github.com/repos/fukata/orca-fleet/commits/main":
+                return {"sha": self.COMMIT}
+            if url == ("https://api.github.com/repos/fukata/orca-fleet/contents/server/orca-serve-update"
+                       f"?ref={self.COMMIT}"):
+                import base64
+                return {"encoding": "base64", "size": len(self.remote),
+                        "content": base64.b64encode(self.remote).decode()}
+            return base_get(url, timeout)
+        self.http.get_json = get_json
+
+    def set_source(self, src):
+        cfg = json.loads(Path(self.paths["config"]).read_text())
+        if src is None:
+            cfg.pop("self_update", None)
+        else:
+            cfg["self_update"] = src
+        Path(self.paths["config"]).write_text(json.dumps(cfg))
+        self.u._cfg = None
+
+    def helper(self):
+        return Path(self.paths["self"]).read_bytes()
+
+    def test_replaces_helper_and_keeps_previous(self):
+        out = self.u.cmd_self_update()
+        self.assertTrue(out["changed"])
+        self.assertEqual(self.helper(), self.remote)
+        self.assertEqual(Path(self.paths["state_dir"], "orca-serve-update.prev").read_bytes(), self.OLD)
+        meta = json.loads(Path(self.paths["state_dir"], "helper.json").read_text())
+        self.assertEqual(meta["commit"], self.COMMIT)
+        self.assertEqual(self.u.cmd_status()["helper"]["commit"], self.COMMIT)
+        self.assertFalse(self.u.cmd_self_update()["changed"])   # second run: nothing to do
+
+    def test_dry_run_changes_nothing(self):
+        self.assertTrue(self.u.cmd_self_update(dry_run=True)["changed"])
+        self.assertEqual(self.helper(), self.OLD)
+
+    def test_disabled_without_config(self):
+        self.set_source(None)
+        with self.assertRaises(osu.UpdateError) as e:
+            self.u.cmd_self_update()
+        self.assertEqual(e.exception.code, "self_update_disabled")
+
+    def test_unparsable_helper_is_refused(self):
+        self.remote = b"def broken(:\n"
+        with self.assertRaises(osu.UpdateError):
+            self.u.cmd_self_update()
+        self.assertEqual(self.helper(), self.OLD)
+
+    def test_failed_self_test_is_refused(self):
+        self.sys.selftest = (2, '{"ok": false}')
+        with self.assertRaises(osu.UpdateError) as e:
+            self.u.cmd_self_update()
+        self.assertIn("self-test", e.exception.message)
+        self.assertEqual(self.helper(), self.OLD)
+        self.assertEqual([n for n in os.listdir(os.path.dirname(self.paths["self"])) if n.startswith(".")], [])
+
+    def test_refused_while_worker_runs(self):
+        self.sys.worker_active = True
+        with self.assertRaises(osu.UpdateError) as e:
+            self.u.cmd_self_update()
+        self.assertEqual(e.exception.code, "locked")
+        self.assertEqual(self.helper(), self.OLD)
+
+    def test_source_must_be_a_plain_repo_and_ref(self):
+        for src in ({"repo": "evil/../x", "ref": "main"}, {"repo": "fukata/orca-fleet", "ref": "../main"},
+                    {"repo": "https://example.com/x", "ref": "main"}):
+            self.set_source(src)
+            with self.assertRaises(osu.UpdateError) as e:
+                self.u.cmd_self_update()
+            self.assertEqual(e.exception.code, "bad_config")
+        self.assertEqual(self.urls, [])
 
 
 if __name__ == "__main__":

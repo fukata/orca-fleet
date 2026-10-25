@@ -38,6 +38,7 @@ class FakeServer:
         self.prepare_fail = None
         self.client_sees = None           # override version seen over Orca after update
         self.applies = 0
+        self.helper_self_update = None   # response of the helper `self-update` (None = up to date)
 
 
 class FakeEnv(fleet.Env):
@@ -93,6 +94,8 @@ class FakeEnv(fleet.Env):
         if s.ssh_down:
             return {"ok": False, "error": {"code": "ssh_failed", "message": "unreachable"}}
         cmd = args[0]
+        if cmd == "self-update":
+            return s.helper_self_update or {"ok": True, "changed": False, "commit": "c" * 40}
         if cmd == "status":
             if s.unreachable_polls > 0:
                 s.unreachable_polls -= 1
@@ -486,6 +489,19 @@ class SelfUpdateTests(unittest.TestCase):
             res = fleet.self_update({})
         self.assertIsNone(res["repo"])
         self.assertTrue(res["warnings"])
+
+    def test_server_helpers_are_asked_to_self_update(self):
+        a, b, c = FakeServer("a", "1.4.239"), FakeServer("b", "1.4.239"), FakeServer("c", "1.4.239")
+        b.helper_self_update = {"ok": False, "error": {"code": "self_update_disabled", "message": "off"}}
+        c.helper_self_update = {"ok": False, "error": {"code": "sudo_denied", "message": "password"}}
+        env = FakeEnv([a, b, c])
+        res = fleet.self_update_servers(env, fleet.select_servers(env.cfg, None))
+        self.assertEqual(sorted(res), ["a", "b", "c"])
+        self.assertEqual(fleet.server_self_update_problems(res), ["c"])   # disabled is not a problem
+        self.assertIn(("a", "self-update", True), env.calls)
+        buf = io.StringIO()
+        fleet.print_server_self_update(res, buf)
+        self.assertIn("re-run install.sh once", buf.getvalue())
 
     def test_global_flag_never_blocks_the_command(self):
         env = FakeEnv([FakeServer("a", "1.4.239")])

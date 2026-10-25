@@ -124,16 +124,26 @@ Step 3 で `--then-install` を指定した場合は不要です。
 
 ```bash
 ssh -t <host> 'cd /tmp/osu && sudo ./install.sh --dry-run'            # 確認
-ssh -t <host> 'cd /tmp/osu && sudo ./install.sh --operator <user>'    # 導入
+ssh -t <host> 'cd /tmp/osu && sudo ./install.sh --operator <user> --self-update-repo <owner>/orca-fleet'    # 導入
 ssh <host> 'sudo -n /usr/local/sbin/orca-serve-update --json status'  # パスワードなしで通ること
-cat /etc/orca-serve-update/config.json                                # cli が /usr/bin/orca-ide になっていること
+ssh <host> 'sudo -n /usr/local/sbin/orca-serve-update --json self-update --dry-run'   # 取得元に届くこと
+cat /etc/orca-serve-update/config.json                                # cli が /usr/bin/orca-ide、self_update が設定されていること
 ```
 
-`install.sh` が行うことは次の3つです。
+`install.sh` が行うことは次の4つです。
 
 - helper を `/usr/local/sbin` に置く
 - `orca-updaters` グループを作り、公開サブコマンドだけを許可する sudoers を置く
 - serve の unit を見つけて config.json を書く
+- `--self-update-repo` を指定した場合は、helper の自己更新を有効にする
+
+自己更新を有効にすると、以後はリポジトリに push するだけで、各サーバーの helper も automation の precheck のたびに最新になります。`install.sh` を手で実行し直す必要があるのは、sudoers や `install.sh` 自体が変わったときだけです。取得元を root 所有の config に固定する理由と信頼の前提は、[README](../README.md#サーバーの-helper-の自己更新) を参照してください。
+
+サーバーへファイルを送るときは、作業ツリーではなく git から取り出すと、改行コードが確実に LF になります。
+
+```bash
+git archive HEAD server | ssh <host> 'rm -rf /tmp/osu && mkdir /tmp/osu && tar -x -C /tmp/osu --strip-components=1'
+```
 
 sudo の許可はグループ経由です。グループ追加の直後でも、新しい SSH セッションなら反映されます。
 
@@ -224,7 +234,7 @@ EOF
 
 | 設定 | 意味 |
 |---|---|
-| `--self-update` | 実行前に workspace の clone を `git pull --ff-only` で最新化し、orca-fleet と SKILL.md を入れ直します（[README](../README.md#ツール自身の更新self-update)）。複数の PC に導入していても、リポジトリに push するだけで、各 PC は次の回から新しい版で動きます。失敗しても警告だけで続行します。手動の `run` は precheck を通らないので、prompt 側にも付けます。 |
+| `--self-update` | 実行前に workspace の clone を `git pull --ff-only` で最新化し、orca-fleet と SKILL.md を入れ直します（[README](../README.md#ツール自身の更新self-update)）。続けて、自己更新を有効にしたサーバーの helper にも入れ替えを依頼します。複数の PC やサーバーに導入していても、リポジトリに push するだけで、次の回から全体が新しい版で動きます。失敗しても警告だけで続行します。手動の `run` は precheck を通らないので、prompt 側にも付けます。 |
 | `plan --needs-action` | 更新対象（update / defer）か要復旧（recover-first）のサーバーがあれば exit 0 で実行します。全台が skip か unreachable なら exit 1 で、その回はスキップされます。 |
 | 実行ルール | Orca は agent のターンが終わった時点で、その回を completed として記録します。Claude がコマンドをバックグラウンドで実行して「完了したら報告します」とターンを終えると、更新が終わる前に completed になります。報告も実行履歴に残りません（実際に起きました）。そのため、フォアグラウンドで完了まで待つように指示します。 |
 | `--wait-idle 240` | SAFE で延期されたサーバーについて、最大4分エージェントの終了を待って再試行します。それでも作業中なら次の回に回します。Claude のフォアグラウンド実行は最大10分なので、ダウンロード（約1〜2分）＋待機＋1台あたり約1分の更新が、10分以内に収まる値にします。サーバーが多い場合はさらに短くします。 |

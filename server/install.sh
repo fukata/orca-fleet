@@ -1,12 +1,16 @@
 #!/bin/bash
 # Install orca-serve-update on one server (run as root, from this directory).
 #
-#   sudo ./install.sh [--service orca-serve.service] [--operator USER]... [--dry-run]
+#   sudo ./install.sh [--service orca-serve.service] [--operator USER]...
+#                     [--self-update-repo OWNER/NAME [--self-update-ref main]] [--dry-run]
 #
 # - installs /usr/local/sbin/orca-serve-update (root:root 0755)
 # - creates group orca-updaters and a sudoers rule limited to the helper's
 #   public subcommands (never `_worker` or `init`)
 # - discovers the existing orca serve unit and writes /etc/orca-serve-update/config.json
+# - --self-update-repo: lets `orca-serve-update self-update` replace the helper with
+#   server/orca-serve-update from that GitHub repo/ref (root-owned config; operators
+#   can trigger it but cannot choose the source). Off unless given.
 # Does NOT stop, restart or modify the running orca serve service.
 set -euo pipefail
 
@@ -14,10 +18,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 service=""
 operators=()
 dry_run=0
+self_repo=""
+self_ref="main"
 while [ $# -gt 0 ]; do
   case "$1" in
     --service) service="$2"; shift 2 ;;
     --operator) operators+=("$2"); shift 2 ;;
+    --self-update-repo) self_repo="$2"; shift 2 ;;
+    --self-update-ref) self_ref="$2"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -27,6 +35,8 @@ done
 for u in "${operators[@]}"; do
   [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && id "$u" >/dev/null 2>&1 || { echo "bad operator user: $u" >&2; exit 2; }
 done
+[ -z "$self_repo" ] || [[ "$self_repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$ ]] || { echo "bad repo: $self_repo" >&2; exit 2; }
+[[ "$self_ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ && "$self_ref" != *..* ]] || { echo "bad ref: $self_ref" >&2; exit 2; }
 [ -z "$service" ] || [[ "$service" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service$ ]] || { echo "bad unit: $service" >&2; exit 2; }
 command -v python3 >/dev/null && command -v systemd-run >/dev/null && command -v dpkg >/dev/null \
   || { echo "requires python3, systemd-run and dpkg" >&2; exit 1; }
@@ -48,7 +58,9 @@ Cmnd_Alias ORCA_SERVE_UPDATE = /usr/local/sbin/orca-serve-update --json status, 
     /usr/local/sbin/orca-serve-update --json apply *, \
     /usr/local/sbin/orca-serve-update --json rollback, \
     /usr/local/sbin/orca-serve-update --json rollback *, \
-    /usr/local/sbin/orca-serve-update --json recover
+    /usr/local/sbin/orca-serve-update --json recover, \
+    /usr/local/sbin/orca-serve-update --json self-update, \
+    /usr/local/sbin/orca-serve-update --json self-update --dry-run
 Cmnd_Alias ORCA_SERVE_UPDATE_DENY = /usr/local/sbin/orca-serve-update *_worker*, \
     /usr/local/sbin/orca-serve-update *init*
 Defaults!ORCA_SERVE_UPDATE env_reset, !setenv
@@ -63,6 +75,25 @@ if [ "$dry_run" = 1 ]; then
   python3 -I "$here/orca-serve-update" init ${service:+--service "$service"}
 else
   /usr/local/sbin/orca-serve-update "${init_args[@]}"
+fi
+
+if [ -n "$self_repo" ]; then
+  if [ "$dry_run" = 1 ]; then
+    echo "+ enable self_update from $self_repo@$self_ref in /etc/orca-serve-update/config.json"
+  else
+    python3 -I - "$self_repo" "$self_ref" <<'PY'
+import json, os, sys
+p = "/etc/orca-serve-update/config.json"
+cfg = json.load(open(p))
+cfg["self_update"] = {"repo": sys.argv[1], "ref": sys.argv[2]}
+tmp = p + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(tmp, 0o644)
+os.replace(tmp, p)
+PY
+    echo "self-update enabled: $self_repo@$self_ref"
+  fi
 fi
 
 user="$(python3 -I -c 'import json;print(json.load(open("/etc/orca-serve-update/config.json"))["service_user"])' 2>/dev/null || true)"
