@@ -11,7 +11,7 @@
   - 公式リリースの取得と検証を行います。
   - 更新処理は transient systemd unit に引き渡して実行します。
   - 状態の永続化、監査ログ、ロールバック、中断からの復旧を担います。
-- **`skill/orca-fleet-update`**: Orca 上の Claude から自然言語で操作するためのスキルです。
+- **`skill/orca-fleet`**: Orca 上の Claude から自然言語で操作するためのスキルです。
 
 ---
 
@@ -189,7 +189,7 @@ client/install.sh            ~/.local/bin と ~/.claude/skills へ配置
 server/orca-serve-update     サーバーヘルパー (python3 標準ライブラリのみ)
 server/install.sh            サーバーへの導入 (helper / sudoers / config)
 server/systemd/…/recommended.conf  任意: RestartPreventExitStatus=3 78
-skill/orca-fleet-update/SKILL.md   自然言語操作用スキル
+skill/orca-fleet/SKILL.md   自然言語操作用スキル
 tests/test_server.py         サーバー側ユニットテスト (48)
 tests/test_client.py         クライアント側ユニットテスト (20)
 tests/e2e/                   systemd コンテナでの実 .deb E2E
