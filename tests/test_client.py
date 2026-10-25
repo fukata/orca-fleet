@@ -6,6 +6,7 @@ import io
 import threading
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -156,6 +157,14 @@ class ClientTests(unittest.TestCase):
         self.assertIn("unreachable", out)
         self.assertRegex(out, r"old\s+1\.4\.229.*update")
         self.assertFalse(any(c[1] in {"prepare", "apply"} for c in env.calls))
+
+    def test_plan_needs_action_exit_code(self):
+        env = FakeEnv([FakeServer("same", "1.4.239"), FakeServer("down")])
+        env.servers["down"].ssh_down = True
+        self.assertEqual(run(env, ["plan", "--needs-action"])[0], 1)
+        self.assertEqual(run(FakeEnv([FakeServer("same", "1.4.239"), FakeServer("busy", busy=1)]),
+                             ["plan", "--needs-action"])[0], 0)
+        self.assertEqual(run(FakeEnv([FakeServer("old")]), ["plan", "--needs-action"])[0], 0)
 
     def test_dry_run_changes_nothing(self):
         env = FakeEnv([FakeServer("a"), FakeServer("b")])
@@ -315,6 +324,15 @@ class ClientTests(unittest.TestCase):
         if os.path.realpath(fleet.shutil.which("orca") or "") == "/usr/bin/orca":
             with self.assertRaises(SystemExit):
                 fleet.resolve_orca_cli({"orca_cli": "orca"})
+
+    def test_cli_fallback_per_platform(self):
+        found = {"orca": "/opt/bin/orca"}
+        with mock.patch.object(fleet.shutil, "which", side_effect=found.get):
+            for platform in ("win32", "darwin"):
+                with mock.patch.object(fleet.sys, "platform", platform):
+                    self.assertEqual(fleet.resolve_orca_cli({}), "/opt/bin/orca")
+            with mock.patch.object(fleet.sys, "platform", "linux"), self.assertRaises(SystemExit):
+                fleet.resolve_orca_cli({})
 
 
 if __name__ == "__main__":

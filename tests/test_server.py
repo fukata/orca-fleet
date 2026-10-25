@@ -213,6 +213,10 @@ class TestUpdater(osu.Updater):
     def daemon_processes(self):
         return list(self._daemons)
 
+    def pids_alive(self, pids):
+        live = {d["pid"] for d in self._daemons}
+        return [p for p in pids if p in live]
+
 
 class Base(unittest.TestCase):
     def setUp(self):
