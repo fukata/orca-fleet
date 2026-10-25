@@ -166,13 +166,16 @@ RPM や AppImage でインストールしている環境は対象外です。
 
 ```
 client/orca-fleet            クライアントCLI (python3 標準ライブラリのみ)
+client/orca-fleet.cmd        Windows (PowerShell / cmd) 用ランチャー
 client/install.sh            ~/.local/bin と ~/.claude/skills へ配置
 server/orca-serve-update     サーバーヘルパー (python3 標準ライブラリのみ)
 server/install.sh            サーバーへの導入 (helper / sudoers / config)
+server/migrate-to-system-unit.sh  user unit / AppImage の serve を system unit + .deb へ移行
 server/systemd/…/recommended.conf  任意: RestartPreventExitStatus=3 78
 skill/orca-fleet/SKILL.md   自然言語操作用スキル
-tests/test_server.py         サーバー側ユニットテスト (48)
-tests/test_client.py         クライアント側ユニットテスト (20)
+docs/setup-guide.md          別環境への導入ガイド (現状調査 → 移行 → 導入 → automations)
+tests/test_server.py         サーバー側ユニットテスト (49)
+tests/test_client.py         クライアント側ユニットテスト (22)
 tests/e2e/                   systemd コンテナでの実 .deb E2E
 ```
 
@@ -183,6 +186,8 @@ tests/e2e/                   systemd コンテナでの実 .deb E2E
 - `recommended.conf` は任意です。終了コード 3（別の Orca が稼働中）や 78（設定不備）のときに再起動ループに入るのを防ぎます。
 
 ## 7. インストール・設定手順
+
+別の環境に導入する場合は、[導入ガイド](docs/setup-guide.md) に沿って進めてください。現状調査、user unit や AppImage からの移行、Orca automations での自動更新までを扱っています。
 
 ### サーバーごと
 
@@ -205,6 +210,13 @@ client/install.sh
 orca-fleet discover            # paired 環境を列挙 (headless serve のみ enabled)
 orca-fleet discover --write    # ~/.config/orca-fleet/config.json
 ```
+
+#### Windows クライアント
+
+- Git Bash で `client/install.sh` を実行します。`~/.local/bin` に `orca-fleet` と `orca-fleet.cmd` が入るので、PowerShell や cmd からも `orca-fleet` で呼べます（`~/.local/bin` を PATH に入れておきます）。
+- 前提は python 3.10 以上と OpenSSH クライアント（Windows 標準）です。
+- Windows と macOS の Orca CLI は `orca` です。`orca-ide` が見つからない場合は `orca` を使います。明示したい場合は設定ファイルで `"orca_cli": "orca"` を指定します。
+- リポジトリは `.gitattributes` で LF に固定しています。サーバーへ `scp` するスクリプトが CRLF になると動かないためです。それ以前に clone した作業ツリーは `git add --renormalize .` のあと、`git checkout -- .` でチェックアウトし直してください。
 
 設定ファイルの例です。`ssh` には SSH の接続先名を書きます。`control: true` を付けたサーバーは最後に更新します。
 
@@ -234,7 +246,7 @@ orca-fleet update --yes --track         # (Orca ターミナル内) Run/Task に
 ## 9. テスト
 
 ```bash
-python3 -m unittest discover -s tests -v       # 68 tests
+python3 -m unittest discover -s tests -v       # 71 tests
 ```
 
 ### ユニットテストで扱うケース
