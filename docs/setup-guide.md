@@ -202,18 +202,18 @@ orca automations create \
   --trigger daily --time 04:00 --timezone Asia/Tokyo \
   --provider claude \
   --workspace "path:<orca-fleet リポジトリの絶対パス>" \
-  --precheck "orca-fleet plan --needs-action" --precheck-timeout 120 \
+  --precheck "$HOME/.local/bin/orca-fleet plan --needs-action" --precheck-timeout 120 \
   --missed-run-grace-minutes 120 \
   --fresh-session --enabled \
-  --prompt "$(cat <<'EOF'
+  --prompt "$(cat <<EOF
 orca-fleet で Orca Remote Server (headless serve) を最新安定版に揃える定期実行です。
 
-1. `orca-fleet update --yes --wait-idle 1800 --track` を実行する（SAFE モード）。
-2. 終了後 `orca-fleet status` を実行する。
+1. \`$HOME/.local/bin/orca-fleet update --yes --wait-idle 1800 --track\` を実行する（SAFE モード）。
+2. 終了後 \`$HOME/.local/bin/orca-fleet status\` を実行する。
 3. 結果を日本語で短く報告する: サーバーごとの 旧→新バージョン と結果（succeeded / skipped / deferred / rolled_back / failed / unverified）。
-   失敗・rolled_back・unverified があれば `orca-fleet progress` の error を添える。
+   失敗・rolled_back・unverified があれば \`$HOME/.local/bin/orca-fleet progress\` の error を添える。
 
-禁止: `--mode force`、`rollback`、`recover`、設定ファイルやサーバーの手動変更。問題があれば報告だけして終了する。
+禁止: \`--mode force\`、\`rollback\`、\`recover\`、設定ファイルやサーバーの手動変更。問題があれば報告だけして終了する。
 EOF
 )"
 ```
