@@ -1,0 +1,1168 @@
+#!/usr/bin/python3 -I
+"""orca-serve-update: server-side updater for a systemd-managed `orca serve`.
+
+Runs on each Linux server. Privileged subcommands (prepare/apply/rollback/
+recover/init) must run as root (normally via a narrow sudoers rule). The actual
+package switch runs in a transient systemd unit started with systemd-run, so it
+keeps going when the SSH session, the Orca worker, or the client disconnects —
+including when `orca serve` itself is restarted.
+
+Only official stablyai/orca GitHub releases are accepted. Downloads are
+verified against the sha256 digest GitHub publishes for each asset, and against
+the .deb control fields, before anything is installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as _dt
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+TOOL_VERSION = "1.0.0"
+
+# --- fixed, non-configurable trust anchors ---------------------------------
+GITHUB_REPO = "stablyai/orca"
+GITHUB_API = "https://api.github.com"
+ALLOWED_DOWNLOAD_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+PACKAGE_NAME = "orca-ide"
+SUPPORTED_ARCHES = {"amd64", "arm64"}
+MAX_DEB_BYTES = 600 * 1024 * 1024
+
+VERSION_RE = re.compile(r"^(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})\Z")
+STABLE_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)\Z")
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,200}\.service\Z")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+OP_ID_RE = re.compile(r"^[0-9a-f]{12}\Z")
+
+# --- filesystem layout ------------------------------------------------------
+PATHS = {
+    "config": "/etc/orca-serve-update/config.json",
+    "state_dir": "/var/lib/orca-serve-update",
+    "cache_dir": "/var/lib/orca-serve-update/cache",
+    "state": "/var/lib/orca-serve-update/state.json",
+    "log_dir": "/var/log/orca-serve-update",
+    "audit": "/var/log/orca-serve-update/audit.jsonl",
+    "lock": "/run/orca-serve-update.lock",
+    "self": "/usr/local/sbin/orca-serve-update",
+}
+WORKER_UNIT = "orca-serve-update-worker.service"
+
+TERMINAL_RESULTS = {"succeeded", "skipped", "deferred", "rolled_back", "failed", "rollback_failed"}
+
+
+class UpdateError(Exception):
+    """An expected, reportable failure."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _only_deferrals(report: dict) -> bool:
+    """True when every blocker is a SAFE-mode session-protection deferral."""
+    return bool(report.get("blockers")) and set(report["blockers"]) <= set(report.get("deferrals") or [])
+
+
+def now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_version(v: str) -> tuple[int, int, int]:
+    m = VERSION_RE.match(v or "")
+    if not m:
+        raise UpdateError("invalid_version", f"invalid version string: {v!r}")
+    return tuple(int(x) for x in m.groups())  # type: ignore[return-value]
+
+
+def validate_version_arg(v: str) -> str:
+    if v == "latest":
+        return v
+    parse_version(v)
+    return v
+
+
+# --- process runner (injectable for tests) ---------------------------------
+class Runner:
+    def run(self, argv: list[str], *, timeout: float = 120, env: dict | None = None,
+            check: bool = False) -> subprocess.CompletedProcess:
+        if not argv or not isinstance(argv, list):
+            raise ValueError("argv must be a non-empty list")
+        base_env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+        if env:
+            base_env.update(env)
+        cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=base_env)
+        if check and cp.returncode != 0:
+            raise UpdateError("command_failed",
+                              f"{argv[0]} exited {cp.returncode}: {(cp.stderr or cp.stdout).strip()[:500]}")
+        return cp
+
+
+# --- HTTP (official GitHub only) -------------------------------------------
+class _RestrictedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _check_url(url: str) -> None:
+    p = urllib.parse.urlparse(url)
+    if p.scheme != "https" or (p.hostname or "") not in ALLOWED_DOWNLOAD_HOSTS:
+        raise UpdateError("forbidden_url", f"refusing non-official URL: {url}")
+
+
+class Http:
+    def __init__(self) -> None:
+        self._opener = urllib.request.build_opener(_RestrictedRedirect())
+
+    def get_json(self, url: str, timeout: float = 30):
+        _check_url(url)
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"orca-serve-update/{TOOL_VERSION}",
+        })
+        try:
+            with self._opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read(5 * 1024 * 1024).decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise UpdateError("github_http_error", f"GitHub API {e.code} for {url}") from e
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+            raise UpdateError("network_error", f"cannot reach GitHub: {e}") from e
+
+    def download(self, url: str, fd: int, max_bytes: int, timeout: float = 60) -> str:
+        """Stream url into fd; return sha256 hex."""
+        _check_url(url)
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": f"orca-serve-update/{TOOL_VERSION}",
+        })
+        h = hashlib.sha256()
+        total = 0
+        try:
+            with self._opener.open(req, timeout=timeout) as resp:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise UpdateError("download_too_large", "download exceeds size limit")
+                    h.update(chunk)
+                    _write_all(fd, chunk)
+        except urllib.error.HTTPError as e:
+            raise UpdateError("download_failed", f"HTTP {e.code} downloading {url}") from e
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+            raise UpdateError("download_failed", f"network error downloading {url}: {e}") from e
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise UpdateError("disk_full", "no space left while downloading") from e
+            raise
+        return h.hexdigest()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+# --- release metadata -------------------------------------------------------
+def _release_info(rel: dict, arch: str) -> dict:
+    tag = rel.get("tag_name", "")
+    m = STABLE_TAG_RE.match(tag)
+    if not m:
+        raise UpdateError("not_stable_release", f"release tag {tag!r} is not a stable vX.Y.Z tag")
+    if rel.get("prerelease") or rel.get("draft"):
+        raise UpdateError("not_stable_release", f"release {tag} is a prerelease/draft")
+    version = m.group(1)
+    parse_version(version)
+    want = f"{PACKAGE_NAME}_{version}_{arch}.deb"
+    for a in rel.get("assets", []):
+        if a.get("name") == want:
+            digest = a.get("digest") or ""
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise UpdateError("missing_checksum", f"{want} has no sha256 digest in release metadata")
+            url = a.get("browser_download_url", "")
+            expected = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{want}"
+            if url != expected:
+                raise UpdateError("forbidden_url", f"unexpected asset URL for {want}: {url}")
+            size = int(a.get("size") or 0)
+            if not 0 < size <= MAX_DEB_BYTES:
+                raise UpdateError("bad_asset", f"unexpected asset size {size} for {want}")
+            return {"version": version, "tag": tag, "asset": want, "url": url,
+                    "sha256": digest.split(":", 1)[1], "size": size,
+                    "published_at": rel.get("published_at")}
+    raise UpdateError("asset_not_found", f"release {tag} has no {want}")
+
+
+def resolve_release(http: Http, version: str, arch: str) -> dict:
+    if arch not in SUPPORTED_ARCHES:
+        raise UpdateError("unsupported_arch", f"unsupported architecture {arch!r}")
+    if version == "latest":
+        rels = http.get_json(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases?per_page=40")
+        stable = []
+        for r in rels if isinstance(rels, list) else []:
+            m = STABLE_TAG_RE.match(r.get("tag_name", ""))
+            if m and not r.get("prerelease") and not r.get("draft") and VERSION_RE.match(m.group(1)):
+                stable.append((parse_version(m.group(1)), r))
+        if not stable:
+            raise UpdateError("no_stable_release", "no stable release found")
+        stable.sort(key=lambda x: x[0], reverse=True)
+        return _release_info(stable[0][1], arch)
+    parse_version(version)
+    rel = http.get_json(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases/tags/v{version}")
+    return _release_info(rel, arch)
+
+
+# --- safe filesystem helpers ------------------------------------------------
+def ensure_root_dir(path: str, mode: int, owner_uid: int = 0) -> None:
+    """Create/verify a root-owned directory that is not a symlink."""
+    try:
+        os.mkdir(path, mode)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        raise UpdateError("unsafe_path", f"{path} is not a real directory")
+    if st.st_uid != owner_uid:
+        raise UpdateError("unsafe_path", f"{path} is not owned by root")
+    if st.st_mode & 0o022:
+        raise UpdateError("unsafe_path", f"{path} is group/world writable")
+    os.chmod(path, mode)
+
+
+def atomic_write_json(path: str, data, mode: int = 0o644) -> None:
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
+    try:
+        _write_all(fd, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode())
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def read_json(path: str, default=None):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return default
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return default
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# --- the updater ------------------------------------------------------------
+class Updater:
+    def __init__(self, runner: Runner | None = None, http: Http | None = None,
+                 paths: dict | None = None, require_root: bool = True,
+                 sleep=time.sleep, clock=time.monotonic) -> None:
+        self.runner = runner or Runner()
+        self.http = http or Http()
+        self.paths = dict(PATHS, **(paths or {}))
+        self.require_root = require_root
+        self.owner_uid = 0 if require_root else os.getuid()
+        self.sleep = sleep
+        self.clock = clock
+        self._cfg: dict | None = None
+
+    # ---------- config ----------
+    def config(self) -> dict:
+        if self._cfg is None:
+            cfg = read_json(self.paths["config"])
+            if not cfg:
+                raise UpdateError("not_configured",
+                                  f"{self.paths['config']} missing; run `orca-serve-update init`")
+            self._cfg = self._validate_config(cfg)
+        return self._cfg
+
+    @staticmethod
+    def _validate_config(cfg: dict) -> dict:
+        unit = cfg.get("service", "")
+        user = cfg.get("service_user", "")
+        if not UNIT_RE.match(unit):
+            raise UpdateError("bad_config", f"invalid service unit name {unit!r}")
+        if not USER_RE.match(user):
+            raise UpdateError("bad_config", f"invalid service user {user!r}")
+        port = int(cfg.get("port") or 0)
+        if not 0 < port < 65536:
+            raise UpdateError("bad_config", "invalid port")
+        cli = cfg.get("cli", "/usr/bin/orca-ide")
+        if not os.path.isabs(cli):
+            raise UpdateError("bad_config", "cli must be an absolute path")
+        out = dict(cfg)
+        out.update(service=unit, service_user=user, port=port, cli=cli)
+        out.setdefault("safe_idle_seconds", 120)
+        out.setdefault("verify_timeout_seconds", 120)
+        out.setdefault("stability_seconds", 15)
+        out.setdefault("min_free_mb", 1024)
+        return out
+
+    def _check_root(self) -> None:
+        if self.require_root and os.geteuid() != 0:
+            raise UpdateError("permission_denied", "this subcommand must run as root (use sudo)")
+
+    # ---------- audit / state ----------
+    def audit(self, event: str, **fields) -> None:
+        rec = {"ts": now_iso(), "event": event, "host": socket.gethostname(),
+               "sudo_user": os.environ.get("SUDO_USER"), **fields}
+        try:
+            fd = os.open(self.paths["audit"], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o640)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass  # status/read-only paths may lack permission; never fail on audit
+
+    def load_state(self) -> dict:
+        return read_json(self.paths["state"], default={}) or {}
+
+    def save_state(self, st: dict) -> None:
+        st["updated_at"] = now_iso()
+        atomic_write_json(self.paths["state"], st)
+
+    def set_phase(self, st: dict, phase: str, **extra) -> None:
+        st["phase"] = phase
+        st.setdefault("history", []).append({"ts": now_iso(), "phase": phase, **extra})
+        st.update(extra)
+        self.save_state(st)
+        self.audit("phase", op_id=st.get("op_id"), phase=phase, **extra)
+
+    def init_dirs(self) -> None:
+        ensure_root_dir(os.path.dirname(self.paths["config"]), 0o755, self.owner_uid)
+        ensure_root_dir(self.paths["state_dir"], 0o755, self.owner_uid)
+        ensure_root_dir(self.paths["cache_dir"], 0o700, self.owner_uid)
+        ensure_root_dir(self.paths["log_dir"], 0o750, self.owner_uid)
+
+    # ---------- system facts ----------
+    def arch(self) -> str:
+        a = self.runner.run(["dpkg", "--print-architecture"], check=True).stdout.strip()
+        if a not in SUPPORTED_ARCHES:
+            raise UpdateError("unsupported_arch", f"unsupported architecture {a!r}")
+        return a
+
+    def installed_version(self) -> str | None:
+        cp = self.runner.run(["dpkg-query", "-W", "-f=${Status}\t${Version}", PACKAGE_NAME])
+        if cp.returncode != 0:
+            return None
+        status, _, ver = cp.stdout.strip().partition("\t")
+        if not status.endswith("installed") or "not-installed" in status:
+            return None
+        return ver if VERSION_RE.match(ver) else ver or None
+
+    def service_state(self) -> dict:
+        unit = self.config()["service"]
+        cp = self.runner.run(["systemctl", "show", unit, "--no-pager",
+                              "-p", "ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestamp,ExecMainStatus,Result"])
+        out: dict = {}
+        for line in cp.stdout.splitlines():
+            k, _, v = line.partition("=")
+            out[k] = v
+        try:
+            out["MainPID"] = int(out.get("MainPID") or 0)
+            out["NRestarts"] = int(out.get("NRestarts") or 0)
+        except ValueError:
+            pass
+        return out
+
+    def port_listening(self) -> bool:
+        port = self.config()["port"]
+        cp = self.runner.run(["ss", "-H", "-ltn", f"sport = :{port}"])
+        return cp.returncode == 0 and bool(cp.stdout.strip())
+
+    def _user_env(self) -> tuple[list[str], dict]:
+        user = self.config()["service_user"]
+        pw = pwd.getpwnam(user)
+        prefix = ["runuser", "-u", user, "--"] if os.geteuid() == 0 else []
+        env = {"HOME": pw.pw_dir, "USER": user, "LOGNAME": user,
+               "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}"}
+        return prefix, env
+
+    def orca_cli_json(self, args: list[str], timeout: float = 30) -> dict | None:
+        """Run the Orca CLI as the service user against its local runtime."""
+        prefix, env = self._user_env()
+        if os.geteuid() != 0 and pwd.getpwuid(os.geteuid()).pw_name != self.config()["service_user"]:
+            return None
+        try:
+            cp = self.runner.run(prefix + [self.config()["cli"], *args, "--json"], timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            return None
+        try:
+            return json.loads(cp.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def runtime_status(self) -> dict:
+        d = self.orca_cli_json(["status"], timeout=20)
+        if not d or not d.get("ok"):
+            return {"reachable": False, "error": (d or {}).get("error")}
+        rt = d.get("result", {}).get("runtime", {})
+        return {"reachable": bool(rt.get("reachable")), "state": rt.get("state"),
+                "appVersion": rt.get("appVersion"), "runtimeId": rt.get("runtimeId")}
+
+    # ---------- session / agent activity ----------
+    def activity(self) -> dict:
+        """Summarise agents on this server from `orca worktree ps --json`.
+
+        Orca's own agent state is used: `working` means a turn is running. A
+        `working` agent whose workingMode is `monitoring` (e.g. a /loop waiting
+        between wakeups) is reported separately so it cannot block updates
+        forever. When the runtime cannot be queried the result is `known: false`
+        — never "idle".
+        """
+        d = self.orca_cli_json(["worktree", "ps"], timeout=40)
+        if not d or not d.get("ok"):
+            return {"known": False, "reason": "worktree ps unavailable", "busy": [], "monitoring": [],
+                    "blocked": [], "agents": 0, "live_terminals": None}
+        res = d.get("result") or {}
+        busy, monitoring, blocked = [], [], []
+        agents = live = unverifiable = 0
+        for w in res.get("worktrees", []) if isinstance(res, dict) else []:
+            if not isinstance(w, dict):
+                continue
+            live += int(w.get("liveTerminalCount") or 0)
+            unverifiable += int(w.get("unverifiableTerminalCount") or 0)
+            for a in w.get("agents") or []:
+                if not isinstance(a, dict):
+                    continue
+                agents += 1
+                item = {"agent": a.get("agentType"), "worktree": w.get("displayName") or w.get("branch"),
+                        "state": a.get("state"), "since": a.get("stateStartedAt"),
+                        "title": (a.get("taskTitle") or a.get("displayName") or a.get("prompt") or "")[:80]}
+                if a.get("state") == "working":
+                    (monitoring if a.get("workingMode") == "monitoring" else busy).append(item)
+                elif a.get("state") == "blocked":
+                    blocked.append(item)
+        return {"known": True, "agents": agents, "live_terminals": live,
+                "unverifiable_terminals": unverifiable, "busy": busy, "monitoring": monitoring,
+                "blocked": blocked, "truncated": bool(res.get("truncated"))}
+
+    def daemon_processes(self) -> list[dict]:
+        """Orca PTY daemons of the service user, with their wire protocol version.
+
+        Only daemons on the user's profile socket (~/.config/orca/daemon) hold
+        user terminals; the serve's private browser daemon (/tmp/...) is ignored.
+        """
+        user = self.config()["service_user"]
+        pw = pwd.getpwnam(user)
+        sock_re = re.compile(re.escape(os.path.join(pw.pw_dir, ".config/orca/daemon/")) + r"daemon-v(\d+)\.sock\Z")
+        out = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                if os.stat(f"/proc/{name}").st_uid != pw.pw_uid:
+                    continue
+                with open(f"/proc/{name}/cmdline", "rb") as f:
+                    argv = f.read().decode("utf-8", "replace").split("\0")
+            except OSError:
+                continue
+            if not any(a.endswith("daemon-entry.js") for a in argv) or "--socket" not in argv:
+                continue
+            i = argv.index("--socket")
+            m = sock_re.match(argv[i + 1]) if i + 1 < len(argv) else None
+            if m:
+                out.append({"pid": int(name), "protocol": int(m.group(1))})
+        return sorted(out, key=lambda d: d["pid"])
+
+    def pty_daemons(self) -> list[int]:
+        return [d["pid"] for d in self.daemon_processes()]
+
+    def linger_enabled(self) -> bool | None:
+        cp = self.runner.run(["loginctl", "show-user", self.config()["service_user"], "-p", "Linger", "--value"])
+        v = cp.stdout.strip()
+        return True if v == "yes" else False if v == "no" else None
+
+    def protocol_facts(self, version: str) -> dict:
+        """Daemon protocol facts of an official release, read from its tagged source.
+
+        Same rule Orca applies (orcadBuildCanAttachDaemon): the incoming build can
+        route an existing daemon's sessions only if it speaks that protocol or
+        lists it in PREVIOUS_DAEMON_PROTOCOL_VERSIONS.
+        """
+        parse_version(version)
+        url = (f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/src/main/daemon/daemon-protocol-version.ts"
+               f"?ref=v{version}")
+        meta = self.http.get_json(url)
+        src = base64.b64decode(meta.get("content", "")).decode("utf-8", "replace")
+        cur = re.findall(r"^export const PROTOCOL_VERSION\b[^=\n]*=\s*(\d+)\s*$", src, re.M)
+        prev = re.findall(r"^export const PREVIOUS_DAEMON_PROTOCOL_VERSIONS\b[^=\n]*=\s*\[([^\]]*)\]", src, re.M)
+        if len(cur) != 1 or len(prev) != 1:
+            raise UpdateError("protocol_facts_unreadable", f"cannot parse daemon protocol facts for {version}")
+        previous = sorted({int(x) for x in re.findall(r"\d+", prev[0])})
+        return {"protocol": int(cur[0]), "previous": previous}
+
+    @staticmethod
+    def can_attach(facts: dict, owner_protocol: int) -> bool:
+        return owner_protocol == facts["protocol"] or owner_protocol in facts["previous"]
+
+    def pids_alive(self, pids: list[int]) -> list[int]:
+        return [p for p in pids if os.path.exists(f"/proc/{p}")]
+
+    # ---------- install-target sanity ----------
+    def check_install_target(self) -> dict:
+        """Verify ownership/permissions of the package install (anti-tamper)."""
+        cp = self.runner.run(["dpkg-query", "-L", PACKAGE_NAME])
+        files = cp.stdout.splitlines() if cp.returncode == 0 else []
+        roots = sorted({"/" + f.strip("/").split("/")[0] + "/" + f.strip("/").split("/")[1]
+                        for f in files if f.startswith("/opt/") and f.count("/") >= 2})
+        problems = []
+        for r in roots:
+            try:
+                st = os.lstat(r)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                problems.append(f"{r} is a symlink")
+            elif st.st_uid != 0 or st.st_mode & 0o022:
+                problems.append(f"{r} not root-owned or is group/world writable")
+        cli = self.config()["cli"]
+        real = os.path.realpath(cli)
+        if roots and not any(real.startswith(r + "/") for r in roots):
+            problems.append(f"{cli} resolves outside the package install dir ({real})")
+        return {"install_roots": roots, "problems": problems}
+
+    # ---------- cache ----------
+    def cache_path(self, version: str, arch: str) -> str:
+        parse_version(version)
+        return os.path.join(self.paths["cache_dir"], f"{PACKAGE_NAME}_{version}_{arch}.deb")
+
+    def meta_path(self, version: str, arch: str) -> str:
+        return self.cache_path(version, arch) + ".json"
+
+    def verify_cached(self, version: str, arch: str) -> dict:
+        path = self.cache_path(version, arch)
+        meta = read_json(self.meta_path(version, arch))
+        if not meta:
+            raise UpdateError("not_prepared", f"{version} is not prepared")
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != self.owner_uid or st.st_mode & 0o077:
+            raise UpdateError("unsafe_path", f"cached package {path} has unsafe ownership/mode")
+        digest = sha256_file(path)
+        if digest != meta.get("sha256"):
+            raise UpdateError("checksum_mismatch", f"cached {version} does not match recorded sha256")
+        self._check_deb_fields(path, version, arch)
+        return meta
+
+    def _check_deb_fields(self, path: str, version: str, arch: str) -> None:
+        cp = self.runner.run(["dpkg-deb", "-f", path, "Package", "Version", "Architecture"])
+        if cp.returncode != 0:
+            raise UpdateError("bad_package", f"dpkg-deb cannot read {os.path.basename(path)}")
+        fields = {}
+        for line in cp.stdout.splitlines():
+            k, _, v = line.partition(":")
+            fields[k.strip()] = v.strip()
+        if fields.get("Package") != PACKAGE_NAME or fields.get("Version") != version \
+                or fields.get("Architecture") != arch:
+            raise UpdateError("bad_package", f"package fields mismatch: {fields}")
+
+    def fetch(self, rel: dict, arch: str) -> dict:
+        """Download + verify one release asset into the cache (idempotent)."""
+        version = rel["version"]
+        final = self.cache_path(version, arch)
+        meta = read_json(self.meta_path(version, arch))
+        if meta and meta.get("sha256") == rel["sha256"] and os.path.exists(final):
+            try:
+                self.verify_cached(version, arch)
+                return {"version": version, "cached": True, "path": final}
+            except UpdateError:
+                pass
+        free = shutil.disk_usage(self.paths["cache_dir"]).free
+        if free < rel["size"] * 2 + 256 * 1024 * 1024:
+            raise UpdateError("disk_full", f"not enough free space in {self.paths['cache_dir']} "
+                                           f"({free // 2**20} MiB free)")
+        fd, tmp = tempfile.mkstemp(dir=self.paths["cache_dir"], prefix=".dl-", suffix=".deb")
+        try:
+            os.fchmod(fd, 0o600)
+            digest = self.http.download(rel["url"], fd, max_bytes=min(MAX_DEB_BYTES, rel["size"] + 1))
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            if os.path.getsize(tmp) != rel["size"]:
+                raise UpdateError("download_incomplete", "downloaded size differs from release metadata")
+            if digest != rel["sha256"]:
+                raise UpdateError("checksum_mismatch",
+                                  f"sha256 mismatch for {rel['asset']}: got {digest}, want {rel['sha256']}")
+            self._check_deb_fields(tmp, version, arch)
+            os.replace(tmp, final)
+            tmp = ""
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        facts = None
+        try:
+            facts = self.protocol_facts(version)
+        except UpdateError:
+            pass  # recorded as unknown; SAFE preflight then treats crossing as unverifiable
+        atomic_write_json(self.meta_path(version, arch),
+                          {**rel, "arch": arch, "fetched_at": now_iso(), "daemon_protocol": facts}, mode=0o600)
+        return {"version": version, "cached": False, "path": final, "daemon_protocol": facts}
+
+    def prune(self, keep: set[str]) -> list[str]:
+        removed = []
+        for name in os.listdir(self.paths["cache_dir"]):
+            m = re.fullmatch(rf"{PACKAGE_NAME}_(\d+\.\d+\.\d+)_[a-z0-9]+\.deb(\.json)?", name)
+            if m and m.group(1) not in keep:
+                os.unlink(os.path.join(self.paths["cache_dir"], name))
+                removed.append(name)
+        return removed
+
+    # ---------- subcommands ----------
+    def cmd_status(self) -> dict:
+        out: dict = {"host": socket.gethostname(), "tool_version": TOOL_VERSION, "ts": now_iso()}
+        try:
+            cfg = self.config()
+            out["service"] = {"unit": cfg["service"], "user": cfg["service_user"], "port": cfg["port"],
+                              **self.service_state(), "listening": self.port_listening()}
+        except UpdateError as e:
+            out["config_error"] = e.message
+            cfg = None
+        out["installed_version"] = self.installed_version()
+        try:
+            out["arch"] = self.arch()
+        except UpdateError as e:
+            out["arch_error"] = e.message
+        if cfg:
+            out["runtime"] = self.runtime_status()
+            out["activity"] = self.activity()
+            out["daemons"] = self.daemon_processes()
+            out["linger"] = self.linger_enabled()
+        st = self.load_state()
+        out["state"] = st
+        out["worker_active"] = self.worker_active()
+        if st.get("phase") and st.get("result") is None and not out["worker_active"]:
+            out["stale_operation"] = True  # crashed mid-update: run `recover`
+        try:
+            prepared = sorted(n[len(PACKAGE_NAME) + 1:].split("_")[0]
+                              for n in os.listdir(self.paths["cache_dir"]) if n.endswith(".deb"))
+        except OSError:
+            prepared = None  # cache dir is root-only
+        out["prepared_versions"] = prepared
+        return out
+
+    def worker_active(self) -> bool:
+        cp = self.runner.run(["systemctl", "is-active", WORKER_UNIT])
+        return cp.stdout.strip() in {"active", "activating", "reloading"}
+
+    def cmd_check(self, version: str) -> dict:
+        arch = self.arch()
+        rel = resolve_release(self.http, version, arch)
+        cur = self.installed_version()
+        needs = cur is None or not VERSION_RE.match(cur or "") or parse_version(cur) != parse_version(rel["version"])
+        return {"installed_version": cur, "target": rel, "needs_update": needs,
+                "is_downgrade": bool(cur and VERSION_RE.match(cur) and parse_version(cur) > parse_version(rel["version"]))}
+
+    def cmd_prepare(self, version: str, dry_run: bool = False) -> dict:
+        self._check_root()
+        self.init_dirs()
+        arch = self.arch()
+        target = resolve_release(self.http, version, arch)
+        current = self.installed_version()
+        result = {"target": target["version"], "installed_version": current, "arch": arch,
+                  "install_target": self.check_install_target()}
+        if result["install_target"]["problems"]:
+            raise UpdateError("unsafe_install", "; ".join(result["install_target"]["problems"]))
+        rollback = None
+        if current and VERSION_RE.match(current) and current != target["version"]:
+            rollback = resolve_release(self.http, current, arch)
+        if dry_run:
+            result.update(dry_run=True, would_fetch=[target["asset"]] + ([rollback["asset"]] if rollback else []))
+            return result
+        self.audit("prepare_start", target=target["version"], current=current)
+        with self.lock(blocking=False):
+            result["fetched"] = [self.fetch(target, arch)]
+            if rollback:
+                result["fetched"].append(self.fetch(rollback, arch))
+            keep = {target["version"]} | ({current} if current else set())
+            result["pruned"] = self.prune(keep)
+        st = self.load_state()
+        st["prepared"] = {"target": target["version"], "rollback": current, "arch": arch, "at": now_iso()}
+        self.save_state(st)
+        self.audit("prepare_done", target=target["version"], rollback=current)
+        result["ok"] = True
+        return result
+
+    def lock(self, blocking: bool):
+        updater = self
+
+        class _Lock:
+            def __enter__(self_inner):
+                fd = os.open(updater.paths["lock"], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                except BlockingIOError:
+                    os.close(fd)
+                    raise UpdateError("locked", "another orca-serve-update operation is running")
+                self_inner.fd = fd
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                fcntl.flock(self_inner.fd, fcntl.LOCK_UN)
+                os.close(self_inner.fd)
+
+        return _Lock()
+
+    def preflight(self, version: str, mode: str, in_worker: bool = False) -> dict:
+        """Read-only checks that decide whether an update may start."""
+        cfg = self.config()
+        arch = self.arch()
+        current = self.installed_version()
+        report: dict = {"target": version, "installed_version": current, "mode": mode, "blockers": [],
+                        "warnings": []}
+        if not in_worker and self.worker_active():
+            # checked first: a running op may be mid-switch, so version equality means nothing yet
+            report["blockers"].append("an update worker is already running")
+            return report
+        if current == version:
+            report["skip"] = "already at target version"
+            return report
+        try:
+            self.verify_cached(version, arch)
+        except (UpdateError, FileNotFoundError) as e:
+            report["blockers"].append(f"target not prepared/verified: {getattr(e, 'message', e)}")
+        if current and VERSION_RE.match(current):
+            try:
+                self.verify_cached(current, arch)
+            except (UpdateError, FileNotFoundError) as e:
+                report["blockers"].append(f"rollback package for {current} not available: {getattr(e, 'message', e)}")
+        else:
+            report["blockers"].append("installed version unknown; rollback impossible")
+        free_mb = min(shutil.disk_usage("/opt").free, shutil.disk_usage("/var/lib").free) // 2**20
+        if free_mb < cfg["min_free_mb"]:
+            report["blockers"].append(f"only {free_mb} MiB free (< {cfg['min_free_mb']})")
+        probs = self.check_install_target()["problems"]
+        report["blockers"].extend(probs)
+        act = self.activity()
+        report["activity"] = act
+        daemons = self.daemon_processes()
+        report["daemons"] = daemons
+        report["deferrals"] = []
+
+        class _Block(list):
+            def append(self_inner, msg):
+                if mode == "safe":
+                    report["blockers"].append(msg)
+                    report["deferrals"].append(msg)
+                else:
+                    report["warnings"].append(msg)
+
+        block = _Block()
+        suffix = " (SAFE mode defers)" if mode == "safe" else " (FORCE mode proceeds)"
+        if not act["known"]:
+            block.append("cannot determine running agents (Orca runtime not queryable)" + suffix)
+        else:
+            if act["busy"]:
+                block.append(f"{len(act['busy'])} agent(s) are running a turn" + suffix)
+            if act["monitoring"]:
+                report["warnings"].append(f"{len(act['monitoring'])} agent(s) in monitoring loops (not blocking)")
+            if act["blocked"]:
+                report["warnings"].append(f"{len(act['blocked'])} agent(s) waiting for permission (not blocking)")
+        has_sessions = bool(daemons) or bool(act.get("live_terminals"))
+        if has_sessions:
+            linger = self.linger_enabled()
+            report["linger"] = linger
+            if linger is not True:
+                block.append("user lingering is not enabled: the PTY daemon would die with the service" + suffix)
+            meta = read_json(self.meta_path(version, arch)) or {}
+            facts = meta.get("daemon_protocol")
+            report["incoming_daemon_protocol"] = facts
+            if not facts:
+                block.append("daemon protocol compatibility of the target is unverifiable" + suffix)
+            else:
+                stranded = [d for d in daemons if not self.can_attach(facts, d["protocol"])]
+                report["session_crossing"] = "strands-live-terminals" if stranded else "attachable"
+                if stranded:
+                    block.append(f"target cannot attach daemon protocol(s) {sorted({d['protocol'] for d in stranded})}; "
+                                 "live terminals would be stranded" + suffix)
+                else:
+                    report["warnings"].append(
+                        "live terminals stay on their current daemon (Orca protocol rule says attachable); "
+                        "this is Orca's documented behavior, not a guarantee")
+        else:
+            report["session_crossing"] = "no-live-terminals"
+        return report
+
+    def cmd_apply(self, version: str, mode: str, dry_run: bool = False, allow_downgrade: bool = False) -> dict:
+        self._check_root()
+        parse_version(version)
+        if mode not in {"safe", "force"}:
+            raise UpdateError("bad_mode", "mode must be safe or force")
+        self.init_dirs()
+        current = self.installed_version()
+        if current and VERSION_RE.match(current) and parse_version(current) > parse_version(version) \
+                and not allow_downgrade:
+            raise UpdateError("downgrade_refused", f"{version} is older than installed {current}; "
+                                                   "pass --allow-downgrade (or use rollback)")
+        report = self.preflight(version, mode)
+        if report.get("skip"):
+            self.audit("apply_skipped", target=version, reason=report["skip"])
+            return {**report, "result": "skipped"}
+        if report["blockers"]:
+            res = "deferred" if _only_deferrals(report) else "blocked"
+            self.audit("apply_refused", target=version, mode=mode, blockers=report["blockers"])
+            return {**report, "result": res}
+        if dry_run:
+            return {**report, "result": "dry_run_ok"}
+        op_id = uuid.uuid4().hex[:12]
+        return self._spawn_worker(["_worker", "update", "--version", version, "--mode", mode, "--op-id", op_id],
+                                  op_id, {**report, "op": "update"})
+
+    def cmd_rollback(self, to: str | None, dry_run: bool = False) -> dict:
+        self._check_root()
+        self.init_dirs()
+        st = self.load_state()
+        target = to or st.get("last_success_previous") or (st.get("prepared") or {}).get("rollback")
+        if not target:
+            raise UpdateError("no_rollback_target", "no previous version recorded; pass --to X.Y.Z")
+        parse_version(target)
+        arch = self.arch()
+        self.verify_cached(target, arch)
+        if self.worker_active():
+            raise UpdateError("locked", "an update worker is already running")
+        if dry_run:
+            return {"result": "dry_run_ok", "rollback_to": target, "installed_version": self.installed_version()}
+        op_id = uuid.uuid4().hex[:12]
+        return self._spawn_worker(["_worker", "rollback", "--version", target, "--op-id", op_id],
+                                  op_id, {"op": "rollback", "target": target})
+
+    def cmd_recover(self) -> dict:
+        self._check_root()
+        st = self.load_state()
+        if not st.get("phase") or st.get("result") is not None:
+            return {"result": "nothing_to_recover", "state": st}
+        if self.worker_active():
+            return {"result": "worker_still_running", "state": st}
+        op_id = uuid.uuid4().hex[:12]
+        return self._spawn_worker(["_worker", "recover", "--op-id", op_id], op_id,
+                                  {"op": "recover", "interrupted_op": st.get("op_id")})
+
+    def _spawn_worker(self, args: list[str], op_id: str, info: dict) -> dict:
+        """Hand the operation to a transient systemd unit that outlives this process."""
+        if self.worker_active():
+            raise UpdateError("locked", "an update worker is already running")
+        self.runner.run(["systemctl", "reset-failed", WORKER_UNIT])
+        argv = ["systemd-run", f"--unit={WORKER_UNIT[:-len('.service')]}", "--collect",
+                "--description=Orca serve updater (orca-serve-update)",
+                "-p", "RuntimeMaxSec=1800", "-p", "NoNewPrivileges=yes",
+                "-p", "ProtectKernelModules=yes", "-p", "ProtectKernelTunables=yes",
+                "-p", "ProtectClock=yes", "-p", "LockPersonality=yes",
+                "-p", "KillMode=mixed", "-p", "TimeoutStopSec=60",
+                "--setenv=ORCA_SERVE_UPDATE_SUDO_USER=" + re.sub(r"[^A-Za-z0-9_.-]", "", os.environ.get("SUDO_USER", "")),
+                "/usr/bin/python3", "-I", self.paths["self"], *args]
+        cp = self.runner.run(argv, timeout=30)
+        if cp.returncode != 0:
+            raise UpdateError("spawn_failed", f"systemd-run failed: {cp.stderr.strip()[:300]}")
+        self.audit("worker_spawned", op_id=op_id, args=args)
+        return {**info, "result": "started", "op_id": op_id, "unit": WORKER_UNIT}
+
+    # ---------- worker (runs inside the transient unit) ----------
+    def worker(self, kind: str, version: str | None, mode: str | None, op_id: str) -> int:
+        self._check_root()
+        if not OP_ID_RE.match(op_id):
+            raise UpdateError("bad_op_id", "invalid op id")
+        with self.lock(blocking=False):
+            if kind == "update":
+                return self._worker_update(version, mode, op_id)
+            if kind == "rollback":
+                return self._worker_rollback(version, op_id)
+            if kind == "recover":
+                return self._worker_recover(op_id)
+        raise UpdateError("bad_worker", kind)
+
+    def _new_op(self, op_id: str, kind: str, **extra) -> dict:
+        prev = self.load_state()
+        st = {"op_id": op_id, "op": kind, "started_at": now_iso(), "result": None, "history": [],
+              "requested_by": os.environ.get("ORCA_SERVE_UPDATE_SUDO_USER") or None,
+              "prepared": prev.get("prepared"),
+              "last_success_previous": prev.get("last_success_previous"), **extra}
+        if prev.get("op_id"):
+            st["previous_op"] = {k: prev.get(k) for k in ("op_id", "op", "result", "target", "error")}
+        self.save_state(st)
+        return st
+
+    def _finish(self, st: dict, result: str, **extra) -> int:
+        st.update(result=result, finished_at=now_iso(), **extra)
+        self.set_phase(st, "done", result=result)
+        return 0 if result in {"succeeded", "skipped", "deferred", "rolled_back"} else 1
+
+    def _worker_update(self, version: str, mode: str, op_id: str) -> int:
+        arch = self.arch()
+        current = self.installed_version()
+        st = self._new_op(op_id, "update", target=version, previous=current, mode=mode)
+        self.set_phase(st, "preflight")
+        report = self.preflight(version, mode, in_worker=True)  # re-check: state may have changed
+        st["preflight"] = report
+        if report.get("skip"):
+            return self._finish(st, "skipped", reason=report["skip"])
+        if report["blockers"]:
+            res = "deferred" if _only_deferrals(report) else "failed"
+            return self._finish(st, res, error="; ".join(report["blockers"]))
+        daemons = self.pty_daemons()
+        st["pty_daemons_before"] = daemons
+        try:
+            self._switch(st, version, arch)
+            self._verify(st, version)
+        except UpdateError as e:
+            st["error"] = f"{e.code}: {e.message}"
+            self.audit("update_failed", op_id=op_id, error=st["error"])
+            return self._rollback_after_failure(st, current, arch)
+        st["pty_daemons_after"] = self.pids_alive(daemons)
+        st["sessions_preserved"] = st["pty_daemons_after"] == daemons
+        st["last_success_previous"] = current
+        return self._finish(st, "succeeded")
+
+    def _rollback_after_failure(self, st: dict, previous: str | None, arch: str) -> int:
+        if not previous:
+            return self._finish(st, "rollback_failed", rollback_error="no previous version known")
+        try:
+            self.set_phase(st, "rollback")
+            self._switch(st, previous, arch, rollback=True)
+            self._verify(st, previous)
+            return self._finish(st, "rolled_back")
+        except UpdateError as e:
+            return self._finish(st, "rollback_failed", rollback_error=f"{e.code}: {e.message}")
+
+    def _worker_rollback(self, version: str, op_id: str) -> int:
+        arch = self.arch()
+        current = self.installed_version()
+        st = self._new_op(op_id, "rollback", target=version, previous=current, mode="manual")
+        try:
+            self._switch(st, version, arch, rollback=True)
+            self._verify(st, version)
+        except UpdateError as e:
+            st["error"] = f"{e.code}: {e.message}"
+            return self._finish(st, "failed")
+        return self._finish(st, "succeeded")
+
+    def _worker_recover(self, op_id: str) -> int:
+        """Reconcile an operation interrupted mid-flight (crash, reboot, kill)."""
+        prev = self.load_state()
+        arch = self.arch()
+        target, previous = prev.get("target"), prev.get("previous")
+        current = self.installed_version()
+        st = self._new_op(op_id, "recover", target=target, previous=previous, mode="recover",
+                          interrupted=prev.get("op_id"), interrupted_phase=prev.get("phase"))
+        if prev.get("op") == "rollback":
+            # interrupted manual rollback: the intended end state is `target`
+            previous = target
+        try:
+            if current and target and current == target and prev.get("op") != "rollback":
+                # package switched; check health, keep it if healthy
+                self._ensure_started()
+                self._verify(st, target)
+                return self._finish(st, "succeeded", note="interrupted update completed on recovery")
+        except UpdateError as e:
+            st["error"] = f"{e.code}: {e.message}"
+        return self._rollback_after_failure(st, previous, arch)
+
+    def _ensure_started(self) -> None:
+        unit = self.config()["service"]
+        self.runner.run(["systemctl", "start", unit], timeout=90)
+
+    def _switch(self, st: dict, version: str, arch: str, rollback: bool = False) -> None:
+        unit = self.config()["service"]
+        meta = self.verify_cached(version, arch)
+        self.set_phase(st, "stopping_service", switching_to=version)
+        cp = self.runner.run(["systemctl", "stop", unit], timeout=120)
+        if cp.returncode != 0:
+            raise UpdateError("stop_failed", cp.stderr.strip()[:300])
+        self.set_phase(st, "installing", switching_to=version)
+        cp = self.runner.run(["dpkg", "-i", "--force-downgrade" if rollback else "--refuse-downgrade",
+                              self.cache_path(version, arch)], timeout=600,
+                             env={"DEBIAN_FRONTEND": "noninteractive"})
+        installed = self.installed_version()
+        if cp.returncode != 0 or installed != version:
+            st["dpkg_output"] = (cp.stdout + cp.stderr)[-2000:]
+            # bring the service back with whatever is installed before reporting
+            self.runner.run(["systemctl", "start", unit], timeout=90)
+            raise UpdateError("install_failed", f"dpkg -i {version} failed (installed now: {installed})")
+        self.set_phase(st, "starting_service", switching_to=version, sha256=meta["sha256"])
+        self.runner.run(["systemctl", "reset-failed", unit])
+        cp = self.runner.run(["systemctl", "start", unit], timeout=120)
+        if cp.returncode != 0:
+            raise UpdateError("start_failed", cp.stderr.strip()[:300])
+
+    def _verify(self, st: dict, version: str) -> None:
+        cfg = self.config()
+        self.set_phase(st, "verifying", expecting=version)
+        deadline = self.clock() + cfg["verify_timeout_seconds"]
+        last: dict = {}
+        while self.clock() < deadline:
+            svc = self.service_state()
+            rt = self.runtime_status()
+            listening = self.port_listening()
+            last = {"service": svc, "runtime": rt, "listening": listening}
+            if svc.get("ActiveState") == "active" and svc.get("MainPID") and listening \
+                    and rt.get("reachable") and rt.get("state") == "ready" and rt.get("appVersion") == version:
+                break
+            if svc.get("ActiveState") == "failed":
+                st["verify"] = last
+                raise UpdateError("service_failed", f"{cfg['service']} entered failed state")
+            self.sleep(3)
+        else:
+            st["verify"] = last
+            raise UpdateError("verify_timeout", f"service not healthy at {version} within "
+                                                f"{cfg['verify_timeout_seconds']}s")
+        pid, restarts = last["service"]["MainPID"], last["service"].get("NRestarts")
+        self.sleep(cfg["stability_seconds"])
+        svc = self.service_state()
+        if svc.get("MainPID") != pid or svc.get("NRestarts") != restarts or svc.get("ActiveState") != "active":
+            st["verify"] = {"service": svc}
+            raise UpdateError("unstable", "service restarted during stability window")
+        st["verify"] = {**last, "stable": True}
+        self.save_state(st)
+
+    # ---------- init (discovery of the existing service) ----------
+    def cmd_init(self, service: str | None, write: bool) -> dict:
+        self._check_root()
+        found = self.discover_service(service)
+        if write:
+            self.init_dirs()
+            existing = read_json(self.paths["config"]) or {}
+            cfg = {**existing, **found}
+            self._validate_config(cfg)
+            atomic_write_json(self.paths["config"], cfg)
+            self.audit("init", config=cfg)
+            return {"written": self.paths["config"], "config": cfg}
+        return {"written": None, "discovered": found}
+
+    def discover_service(self, service: str | None) -> dict:
+        units = [service] if service else []
+        if not units:
+            cp = self.runner.run(["systemctl", "list-units", "--type=service", "--all", "--no-legend",
+                                  "--plain", "--no-pager"])
+            for line in cp.stdout.splitlines():
+                name = line.split()[0] if line.split() else ""
+                if not UNIT_RE.match(name):
+                    continue
+                ex = self.runner.run(["systemctl", "show", name, "-p", "ExecStart", "--value"]).stdout
+                if re.search(r"orca(-ide)?\S*\s.*\bserve\b", ex) or "cli/index.js serve" in ex:
+                    units.append(name)
+        if len(units) != 1:
+            raise UpdateError("discovery_ambiguous",
+                              f"expected exactly one orca serve service, found {units}; pass --service")
+        unit = units[0]
+        if not UNIT_RE.match(unit):
+            raise UpdateError("bad_config", f"invalid unit {unit!r}")
+        props = {}
+        for line in self.runner.run(["systemctl", "show", unit, "-p", "User,ExecStart,FragmentPath"]).stdout.splitlines():
+            k, _, v = line.partition("=")
+            props[k] = v
+        user = props.get("User") or ""
+        if not USER_RE.match(user):
+            raise UpdateError("discovery_failed", f"{unit} has no explicit User= (got {user!r})")
+        argv_m = re.search(r"argv\[\]=([^;]*)", props.get("ExecStart", ""))
+        argv = argv_m.group(1).split() if argv_m else []
+        port = 6768
+        if "--port" in argv and argv.index("--port") + 1 < len(argv):
+            port = int(argv[argv.index("--port") + 1])
+        cli = argv[0] if argv and os.path.isabs(argv[0]) else "/usr/bin/orca-ide"
+        return {"service": unit, "service_user": user, "port": port, "cli": cli,
+                "exec_start": " ".join(argv), "unit_file": props.get("FragmentPath")}
+
+
+# --- CLI --------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="orca-serve-update", description=__doc__.split("\n")[0])
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="show service, version, activity and updater state (no root needed)")
+    c = sub.add_parser("check", help="compare installed version with an official release")
+    c.add_argument("--version", default="latest", type=validate_version_arg)
+    pr = sub.add_parser("prepare", help="download + verify target and rollback packages (root)")
+    pr.add_argument("--version", default="latest", type=validate_version_arg)
+    pr.add_argument("--dry-run", action="store_true")
+    ap = sub.add_parser("apply", help="switch to a prepared version via a transient systemd unit (root)")
+    ap.add_argument("--version", required=True, type=validate_version_arg)
+    ap.add_argument("--mode", choices=["safe", "force"], default="safe")
+    ap.add_argument("--allow-downgrade", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    rb = sub.add_parser("rollback", help="return to the previous (or given) prepared version (root)")
+    rb.add_argument("--to", type=validate_version_arg)
+    rb.add_argument("--dry-run", action="store_true")
+    sub.add_parser("recover", help="reconcile an interrupted operation (root)")
+    ini = sub.add_parser("init", help="discover the orca serve unit and write the config (root)")
+    ini.add_argument("--service")
+    ini.add_argument("--write", action="store_true")
+    w = sub.add_parser("_worker", help=argparse.SUPPRESS)
+    w.add_argument("kind", choices=["update", "rollback", "recover"])
+    w.add_argument("--version", type=validate_version_arg)
+    w.add_argument("--mode", choices=["safe", "force"])
+    w.add_argument("--op-id", required=True)
+    return p
+
+
+def main(argv: list[str] | None = None, updater: Updater | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    u = updater or Updater()
+    try:
+        if args.cmd == "status":
+            out = u.cmd_status()
+        elif args.cmd == "check":
+            out = u.cmd_check(args.version)
+        elif args.cmd == "prepare":
+            out = u.cmd_prepare(args.version, args.dry_run)
+        elif args.cmd == "apply":
+            if args.version == "latest":
+                raise UpdateError("invalid_version", "apply needs an explicit X.Y.Z (use the prepared version)")
+            out = u.cmd_apply(args.version, args.mode, args.dry_run, args.allow_downgrade)
+        elif args.cmd == "rollback":
+            out = u.cmd_rollback(args.to, args.dry_run)
+        elif args.cmd == "recover":
+            out = u.cmd_recover()
+        elif args.cmd == "init":
+            out = u.cmd_init(args.service, args.write)
+        elif args.cmd == "_worker":
+            if not os.environ.get("INVOCATION_ID"):
+                raise UpdateError("not_in_systemd", "_worker must run inside the systemd unit")
+            return u.worker(args.kind, args.version, args.mode, args.op_id)
+        else:
+            raise UpdateError("bad_command", args.cmd)
+    except UpdateError as e:
+        err = {"ok": False, "error": {"code": e.code, "message": e.message}}
+        print(json.dumps(err, ensure_ascii=False) if args.json else f"error [{e.code}]: {e.message}",
+              file=sys.stdout if args.json else sys.stderr)
+        return 2
+    print(json.dumps({"ok": True, **out}, ensure_ascii=False, indent=None if args.json else 2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
