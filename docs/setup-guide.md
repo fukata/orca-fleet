@@ -208,7 +208,10 @@ orca automations create \
   --prompt "$(cat <<EOF
 orca-fleet で Orca Remote Server (headless serve) を最新安定版に揃える定期実行です。
 
-1. \`$HOME/.local/bin/orca-fleet update --yes --wait-idle 1800 --track\` を実行する（SAFE モード）。
+実行ルール: コマンドはすべてフォアグラウンドで実行し、タイムアウトは最大（10分）にする。バックグラウンド実行や「完了通知を待つ」でターンを終えない。報告を書き終えるまでターンを終了しない（ターンの終了 = この実行の完了として記録される）。
+
+1. \`$HOME/.local/bin/orca-fleet update --yes --wait-idle 240 --track\` を実行する（SAFE モード）。
+   タイムアウトで打ち切られた場合は update を再実行せず、\`$HOME/.local/bin/orca-fleet progress\` を WORKER_ACTIVE が全サーバー no になるまで繰り返し確認する。
 2. 終了後 \`$HOME/.local/bin/orca-fleet status\` を実行する。
 3. 結果を日本語で短く報告する。1行目は update 出力の \`outcome:\`（nothing_to_update / updated / deferred / rolled_back / failed）をそのまま書く。
    続けてサーバーごとの 旧→新バージョン と結果（succeeded / skipped / deferred / rolled_back / failed / unverified）、status の \`fleet:\` 行（ターゲットに揃っていないサーバー）を書く。
@@ -222,7 +225,8 @@ EOF
 | 設定 | 意味 |
 |---|---|
 | `plan --needs-action` | 更新対象（update / defer）か要復旧（recover-first）のサーバーがあれば exit 0 で実行します。全台が skip か unreachable なら exit 1 で、その回はスキップされます。 |
-| `--wait-idle 1800` | SAFE で延期されたサーバーについて、最大30分エージェントの終了を待って再試行します。それでも作業中なら次の回に回します。 |
+| 実行ルール | Orca は agent のターンが終わった時点で、その回を completed として記録します。Claude がコマンドをバックグラウンドで実行して「完了したら報告します」とターンを終えると、更新が終わる前に completed になります。報告も実行履歴に残りません（実際に起きました）。そのため、フォアグラウンドで完了まで待つように指示します。 |
+| `--wait-idle 240` | SAFE で延期されたサーバーについて、最大4分エージェントの終了を待って再試行します。それでも作業中なら次の回に回します。Claude のフォアグラウンド実行は最大10分なので、ダウンロード（約1〜2分）＋待機＋1台あたり約1分の更新が、10分以内に収まる値にします。サーバーが多い場合はさらに短くします。 |
 | `--track` | 各サーバーの結果を Orchestration の Run/Task に記録します。 |
 | `outcome:` / `fleet:` | `update` が最後に出す実行結果の分類と、全サーバーのバージョンのずれです（[README](../README.md#実行結果の判定outcomeと通知)）。Claude の報告とは別に通知したい場合は、設定ファイルの `notify_command` を使います。 |
 | `--missed-run-grace-minutes` | PC がスリープしていて実行時刻を逃した場合に、何分後まで遅れて実行するかです。既定は 720 分（12時間）なので、日中に実行されることがあります。 |
@@ -233,15 +237,22 @@ EOF
 > その場合、precheck は「コマンドが見つからない」で失敗し、毎回スキップとして記録されます。
 > 例: `--precheck "$HOME/.local/bin/orca-fleet plan --needs-action"`。prompt 内のコマンドも同じパスにそろえます。
 > `$HOME` は作成時のシェルで展開されるので、上のように二重引用符で囲みます。
-> Windows では `orca-fleet.cmd` のフルパス（例: `C:\Users\<user>\.local\bin\orca-fleet.cmd`）を指定します。
+> Windows では `orca-fleet.cmd` のフルパスを指定します。
+> precheck は **バックスラッシュ** で書きます（例: `C:\Users\<user>\.local\bin\orca-fleet.cmd plan --needs-action`）。`C:/Users/...` のようにスラッシュで書くと、cmd では「指定されたパスが見つかりません」で失敗します。
+> prompt 内は Claude が Git Bash か PowerShell で実行するので、スラッシュでもかまいません。
 
 作成後の確認です。
 
 ```bash
 orca automations list
 orca automations run <id>     # 今すぐ実行する。更新対象があれば本当に更新される
-orca automations runs <id>    # 実行履歴（skipped / 成功 / 失敗）
+orca automations runs --id <id> --json   # 実行履歴（status、precheckResult、outputSnapshot）
 ```
+
+実行履歴の `status: completed` は「agent のターンが終わった」という意味で、更新の成否ではありません。
+更新の結果は、`outputSnapshot` に残る Claude の報告か、`orca-fleet progress` で確認します。
+
+`precheck` や `--precheck-timeout` を `edit` で変更すると、指定しなかった方が既定値に戻ることがあります。両方を一緒に指定し、`orca automations show <id> --json` で確認してください。
 
 初回は手動で `run` して、Claude が確認なしでコマンドを実行できるかを確かめてください（ホストのエージェント起動引数の設定によります）。
 
