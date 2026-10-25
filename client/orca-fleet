@@ -811,13 +811,49 @@ def print_self_update(res: dict, stream=None) -> None:
         print(f"self-update: WARNING: {w}", file=stream)
 
 
+def self_update_servers(env: Env, servers: list[dict]) -> dict[str, dict]:
+    """Ask each server's helper to replace itself from its own root-configured repo/ref."""
+    def one(s):
+        return s["name"], env.ssh_helper(s, ["self-update"], sudo=True, timeout=180)
+
+    if not servers:
+        return {}
+    with cf.ThreadPoolExecutor(max_workers=max(1, min(8, len(servers)))) as ex:
+        return dict(ex.map(one, servers))
+
+
+def server_self_update_problems(res: dict[str, dict]) -> list[str]:
+    """Servers whose helper could not be checked (self_update not enabled there is not a problem)."""
+    return [n for n, r in res.items()
+            if not r.get("ok") and (r.get("error") or {}).get("code") != "self_update_disabled"]
+
+
+def print_server_self_update(res: dict[str, dict], stream=None) -> None:
+    stream = stream or sys.stderr
+    for name, r in res.items():
+        if r.get("ok"):
+            state = ("updated to " if r.get("changed") else "up to date at ") + str(r.get("commit", "?"))[:12]
+        else:
+            err = r.get("error") or {}
+            code = err.get("code", "?")
+            if code == "self_update_disabled":
+                state = "disabled (install.sh --self-update-repo OWNER/NAME to enable)"
+            elif code == "sudo_denied":
+                state = "WARNING: sudo_denied (helper predates self-update: re-run install.sh once)"
+            else:
+                state = f"WARNING: {code}: {str(err.get('message', ''))[:200]}"
+        print(f"self-update: server {name}: helper {state}", file=stream)
+
+
 def cmd_self_update(env: Env, args) -> int:
     res = self_update(env.cfg, args.repo, pull=not args.no_pull)
+    servers = {} if args.no_servers else self_update_servers(env, select_servers(env.cfg, args.server))
     if args.json:
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps({"client": res, "servers": servers}, indent=2, ensure_ascii=False))
     else:
         print_self_update(res, sys.stdout)
-    return 0 if not res["warnings"] else 1
+        print_server_self_update(servers, sys.stdout)
+    return 0 if not res["warnings"] and not server_self_update_problems(servers) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -872,6 +908,8 @@ def build_parser() -> argparse.ArgumentParser:
     su = sub.add_parser("self-update", help="git pull --ff-only the orca-fleet clone and install changed files")
     su.add_argument("--repo", help="path of the orca-fleet clone (default: config source_repo, then cwd)")
     su.add_argument("--no-pull", action="store_true", help="only install what the clone already has")
+    su.add_argument("--no-servers", action="store_true", help="do not update the server helpers")
+    su.add_argument("--server", action="append", help="limit server helpers to these names (repeatable)")
     su.add_argument("--json", action="store_true")
     return p
 
@@ -883,13 +921,16 @@ def main(argv: list[str] | None = None, env: Env | None = None) -> int:
             stream.reconfigure(errors="replace")
     env = env or Env(load_config())
     if args.self_update and args.cmd != "self-update":
-        res = self_update(env.cfg)
-        print_self_update(res)
-        me = os.path.join(INSTALL_DIR, "orca-fleet")
-        if me in res["installed"] and os.path.realpath(sys.argv[0]) == os.path.realpath(me):
-            # this process is the old version: re-run the command with the one just installed
-            rest = [a for a in (sys.argv[1:] if argv is None else argv) if a != "--self-update"]
-            return subprocess.run([sys.executable, me, *rest]).returncode
+        if os.environ.get("ORCA_FLEET_SELF_UPDATED") != "1":
+            res = self_update(env.cfg)
+            print_self_update(res)
+            me = os.path.join(INSTALL_DIR, "orca-fleet")
+            if me in res["installed"] and os.path.realpath(sys.argv[0]) == os.path.realpath(me):
+                # this process is the old version: re-run with the one just installed (it does the servers)
+                rest = sys.argv[1:] if argv is None else argv
+                return subprocess.run([sys.executable, me, *rest],
+                                      env={**os.environ, "ORCA_FLEET_SELF_UPDATED": "1"}).returncode
+        print_server_self_update(self_update_servers(env, select_servers(env.cfg, getattr(args, "server", None))))
     handlers = {"discover": cmd_discover, "status": cmd_status, "plan": cmd_plan, "prepare": cmd_prepare,
                 "update": cmd_update, "retry": cmd_retry, "progress": cmd_progress,
                 "rollback": cmd_rollback, "recover": cmd_recover, "self-update": cmd_self_update}

@@ -174,8 +174,8 @@ server/migrate-to-system-unit.sh  user unit / AppImage の serve を system unit
 server/systemd/…/recommended.conf  任意: RestartPreventExitStatus=3 78
 skill/orca-fleet/SKILL.md   自然言語操作用スキル
 docs/setup-guide.md          別環境への導入ガイド (現状調査 → 移行 → 導入 → automations)
-tests/test_server.py         サーバー側ユニットテスト (52)
-tests/test_client.py         クライアント側ユニットテスト (33)
+tests/test_server.py         サーバー側ユニットテスト (59)
+tests/test_client.py         クライアント側ユニットテスト (34)
 tests/e2e/                   systemd コンテナでの実 .deb E2E
 ```
 
@@ -258,7 +258,22 @@ orca-fleet --self-update plan --needs-action    # 先に自己更新し、新し
   - fast-forward できない、またはオフライン
   - 新しい `orca-fleet` が構文エラーで読み込めない（配置しません）
 - `--self-update` で本体が更新された場合は、新しい版でコマンドを実行し直します。
-- 自動で更新するのはクライアント側だけです。サーバーの `orca-serve-update` は root で動くため、更新は `install.sh` を手で実行し直します。
+- 続けて、各サーバーの helper にも自己更新を依頼します（下記）。`orca-fleet self-update --no-servers` を使うとクライアントだけを更新します。
+
+#### サーバーの helper の自己更新
+
+`install.sh --self-update-repo OWNER/NAME` で有効にしたサーバーでは、`sudo -n orca-serve-update --json self-update` で helper が自分自身を入れ替えます。クライアントの `--self-update` はこれを全サーバーに並列で依頼するので、automation の precheck だけでサーバー側も最新になります。
+
+- **取得元は root 所有の config（`self_update.repo` / `ref`）にだけ書きます。** パスワードなしで sudo できる operator は更新を起動できますが、取得元を選ぶことはできません。入れられるのは、設定したリポジトリのそのブランチにあるコードだけです。
+- GitHub API（`api.github.com`）で ref をコミットに解決し、そのコミットの `server/orca-serve-update` を取得します。
+- 入れ替える前に次の3点を確認し、どれかで失敗したら入れ替えません。
+  - 構文として読み込めるか
+  - 新しい helper が `--json status` に `ok: true` を返すか（root で実行）
+  - 更新のワーカーが動いていないか（flock も取る）
+- 入れ替えはアトミックに行います。旧版は `/var/lib/orca-serve-update/orca-serve-update.prev` に残します。適用したコミットは `helper.json` に記録され、`status` の `helper` に表示されます。
+- 更新するのは helper 本体だけです。sudoers や `install.sh` の内容が変わった場合は、`install.sh` を手で実行し直します。
+- **信頼の前提:** 設定したリポジトリに push できる人は、全サーバーの root で動くコードを変えられることになります。GitHub アカウントの 2FA や、`main` のブランチ保護を設定しておいてください。気になる場合は、`--self-update-ref` にレビュー済みのブランチを指定します。
+- 有効にしていないサーバーでは `disabled` と表示されるだけで、警告にはなりません。self-update に対応する前の helper（sudoers に許可がない）では `sudo_denied` と表示されます。その場合は `install.sh` を一度実行し直してください。
 
 ### 実行結果の判定（outcome）と通知
 
@@ -306,7 +321,7 @@ automation の precheck（`plan --needs-action`）で全台 skip だった日は
 ## 9. テスト
 
 ```bash
-python3 -m unittest discover -s tests -v       # 85 tests
+python3 -m unittest discover -s tests -v       # 93 tests
 ```
 
 ### ユニットテストで扱うケース

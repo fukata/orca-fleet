@@ -57,6 +57,14 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,200}\.service\Z")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 OP_ID_RE = re.compile(r"^[0-9a-f]{12}\Z")
 
+# helper self-update: the source repo/ref live only in the root-owned config, so an
+# operator (passwordless sudo) can trigger an update but never choose what gets installed
+SELF_REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}\Z")
+SELF_REF_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}\Z")
+HELPER_REPO_PATH = "server/orca-serve-update"
+MAX_HELPER_BYTES = 2 * 1024 * 1024
+
 # --- filesystem layout ------------------------------------------------------
 PATHS = {
     "config": "/etc/orca-serve-update/config.json",
@@ -332,6 +340,12 @@ class Updater:
         out.setdefault("verify_timeout_seconds", 120)
         out.setdefault("stability_seconds", 15)
         out.setdefault("min_free_mb", 1024)
+        su = cfg.get("self_update")
+        if su is not None:
+            if not (isinstance(su, dict) and SELF_REPO_RE.match(str(su.get("repo", "")))
+                    and SELF_REF_RE.match(str(su.get("ref", "main")))):
+                raise UpdateError("bad_config", "self_update needs {\"repo\": \"owner/name\", \"ref\": \"branch\"}")
+            out["self_update"] = {"repo": su["repo"], "ref": su.get("ref", "main")}
         return out
 
     def _check_root(self) -> None:
@@ -700,6 +714,7 @@ class Updater:
         except OSError:
             prepared = None  # cache dir is root-only
         out["prepared_versions"] = prepared
+        out["helper"] = read_json(self._helper_meta_path(), default=None)
         return out
 
     def worker_active(self) -> bool:
@@ -897,6 +912,78 @@ class Updater:
         op_id = uuid.uuid4().hex[:12]
         return self._spawn_worker(["_worker", "recover", "--op-id", op_id], op_id,
                                   {"op": "recover", "interrupted_op": st.get("op_id")})
+
+    # ---------- helper self-update ----------
+    def _helper_meta_path(self) -> str:
+        return self.paths.get("helper_meta") or os.path.join(self.paths["state_dir"], "helper.json")
+
+    def cmd_self_update(self, dry_run: bool = False) -> dict:
+        """Replace this helper with server/orca-serve-update from the configured repo/ref.
+
+        The new file must parse and answer `--json status` before it is swapped in
+        (atomically, previous version kept). Only the helper is updated: changes to
+        sudoers or install.sh still need `install.sh` to be run by hand.
+        """
+        self._check_root()
+        su = self.config().get("self_update")
+        if not su:
+            raise UpdateError("self_update_disabled",
+                              "self_update is not configured (install.sh --self-update-repo OWNER/NAME)")
+        repo, ref = su["repo"], su["ref"]
+        commit = (self.http.get_json(f"{GITHUB_API}/repos/{repo}/commits/{urllib.parse.quote(ref, safe='')}")
+                  or {}).get("sha", "")
+        if not COMMIT_RE.match(commit):
+            raise UpdateError("self_update_failed", f"cannot resolve {repo}@{ref}")
+        meta = self.http.get_json(f"{GITHUB_API}/repos/{repo}/contents/{HELPER_REPO_PATH}?ref={commit}") or {}
+        if meta.get("encoding") != "base64" or int(meta.get("size") or 0) > MAX_HELPER_BYTES:
+            raise UpdateError("self_update_failed", f"unexpected {HELPER_REPO_PATH} at {commit[:12]}")
+        new = base64.b64decode(meta.get("content", ""))
+        with open(self.paths["self"], "rb") as f:
+            cur = f.read()
+        out = {"repo": repo, "ref": ref, "commit": commit, "changed": new != cur,
+               "sha256": hashlib.sha256(new).hexdigest(), "previous_sha256": hashlib.sha256(cur).hexdigest()}
+        if dry_run or not out["changed"]:
+            if not dry_run:
+                self._record_helper(out)
+            return out
+        try:
+            compile(new, HELPER_REPO_PATH, "exec")
+        except (SyntaxError, ValueError) as e:
+            raise UpdateError("self_update_failed", f"new helper does not parse: {e}") from e
+        with self.lock(blocking=False):
+            if self.worker_active():
+                raise UpdateError("locked", "an update worker is running; try again later")
+            d = os.path.dirname(self.paths["self"])
+            tmp = os.path.join(d, f".orca-serve-update.new-{os.getpid()}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(new)
+                cp = self.runner.run([sys.executable, "-I", tmp, "--json", "status"], timeout=90)
+                try:
+                    ok = json.loads(cp.stdout or "{}").get("ok") is True
+                except ValueError:
+                    ok = False
+                if cp.returncode != 0 or not ok:
+                    raise UpdateError("self_update_failed",
+                                      f"new helper failed its self-test: {(cp.stderr or cp.stdout).strip()[:300]}")
+                prev = os.path.join(self.paths["state_dir"], "orca-serve-update.prev")
+                pfd = os.open(prev + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(pfd, "wb") as f:
+                    f.write(cur)
+                os.replace(prev + ".tmp", prev)
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, self.paths["self"])
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        self._record_helper(out)
+        self.audit("self_update", repo=repo, ref=ref, commit=commit, sha256=out["sha256"])
+        return out
+
+    def _record_helper(self, info: dict) -> None:
+        atomic_write_json(self._helper_meta_path(), {k: info[k] for k in ("repo", "ref", "commit", "sha256")}
+                          | {"checked_at": now_iso()})
 
     def _spawn_worker(self, args: list[str], op_id: str, info: dict) -> dict:
         """Hand the operation to a transient systemd unit that outlives this process."""
@@ -1149,6 +1236,8 @@ def build_parser() -> argparse.ArgumentParser:
     rb.add_argument("--to", type=validate_version_arg)
     rb.add_argument("--dry-run", action="store_true")
     sub.add_parser("recover", help="reconcile an interrupted operation (root)")
+    su = sub.add_parser("self-update", help="replace this helper from the configured repo/ref (root)")
+    su.add_argument("--dry-run", action="store_true")
     ini = sub.add_parser("init", help="discover the orca serve unit and write the config (root)")
     ini.add_argument("--service")
     ini.add_argument("--write", action="store_true")
@@ -1178,6 +1267,8 @@ def main(argv: list[str] | None = None, updater: Updater | None = None) -> int:
             out = u.cmd_rollback(args.to, args.dry_run)
         elif args.cmd == "recover":
             out = u.cmd_recover()
+        elif args.cmd == "self-update":
+            out = u.cmd_self_update(args.dry_run)
         elif args.cmd == "init":
             out = u.cmd_init(args.service, args.write)
         elif args.cmd == "_worker":
