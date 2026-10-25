@@ -264,6 +264,22 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(s.applies, 0)
         self.assertEqual(env.servers["b"].version, "1.4.239")
 
+    def test_wait_idle_retries_deferred_server(self):
+        s = FakeServer("a", busy=1)
+        env = FakeEnv([s])
+        orig = env.ssh_helper
+
+        def becomes_idle(server, args, sudo, timeout=900):
+            if args[0] == "apply" and s.applies >= 2:
+                s.busy = 0  # agent finished its turn while we waited
+            return orig(server, args, sudo, timeout)
+
+        env.ssh_helper = becomes_idle
+        rc, out = run(env, ["update", "--yes", "--wait-idle", "3600"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("re-checking in 60s", out)
+        self.assertEqual(s.version, "1.4.239")
+
     def test_retry_targets_failed_servers_only(self):
         a, b = FakeServer("a", "1.4.239"), FakeServer("b")
         b.state = {"op_id": "x", "result": "rolled_back"}
