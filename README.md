@@ -316,3 +316,7 @@ E2E の途中で、ユニットテストでは見つからなかったバグを2
 | `stale_operation` | ワーカーが中断されています（再起動や kill など）。`orca-fleet recover --server X` を実行します。 |
 | ワーカーの確認 | `systemctl status orca-serve-update-worker`、`journalctl -u orca-serve-update-worker` |
 | アンインストール | `sudo rm /usr/local/sbin/orca-serve-update /etc/sudoers.d/orca-serve-update; sudo rm -r /etc/orca-serve-update /var/lib/orca-serve-update /var/log/orca-serve-update; sudo groupdel orca-updaters` |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
