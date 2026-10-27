@@ -178,7 +178,14 @@ class ClientTests(unittest.TestCase):
 
     def test_status_summarizes_missing_releases(self):
         body = ("## Faster and safer\n\nIntro.\n\n## The short version\n\n- **Speed:** Terminals are faster.\n"
-                "- **Fixes:** Many fixes.\n\n## Compatibility & upgrade notes\n\n- **Chat:** Restart chats.\n")
+                "- **Fixes:** Many fixes.\n\n**Phone updates:** Phones redraw less.\n\n"
+                "## Compatibility & upgrade notes\n\n- **Chat:** Restart chats.\n\n## Product experience\n\n"
+                "### Terminals\n\n*Lighter terminals.*\n\n"
+                "* Use less idle CPU by @a-b in https://github.com/stablyai/orca/pull/123\n"
+                "* Fix Korean input by @x and @y in https://github.com/stablyai/orca/pull/124\n\n"
+                "### Tests, builds & maintenance\n\n<details>\n<summary>All</summary>\n\n"
+                "* test: drop suites by @a in https://github.com/stablyai/orca/pull/9\n\n</details>\n\n"
+                "## New Contributors\n* @z made their first contribution\n")
         rels = [{"tag_name": "v1.4.239", "prerelease": False, "draft": False, "published_at": "2026-10-02T00:00:00Z",
                  "html_url": "https://example/v1.4.239", "body": body},
                 {"tag_name": "v1.4.238", "prerelease": False, "draft": False, "published_at": "2026-10-01T00:00:00Z",
@@ -193,11 +200,22 @@ class ClientTests(unittest.TestCase):
         self.assertIn("    - Speed: Terminals are faster.", out)
         self.assertIn("    - one fix", out)
         self.assertIn("    ! Chat: Restart chats.", out)
+        self.assertIn("    - Phone updates: Phones redraw less.", out)
+        self.assertIn("    [Terminals] Lighter terminals.\n      * Use less idle CPU (#123)\n"
+                      "      * Fix Korean input (#124)\n", out)
+        self.assertIn("[Tests, builds & maintenance] 1 item(s) omitted", out)
+        self.assertNotIn("test: drop suites", out)
+        self.assertNotIn("first contribution", out)
+        short = run(env, ["status", "--changes", "short"])[1]
+        self.assertIn("! Chat: Restart chats.", short)
+        self.assertNotIn("[Terminals]", short)
         self.assertNotIn("- old", out)
         self.assertLess(out.index("  1.4.238 ("), out.index("  1.4.239 ("))
         changes = json.loads(run(env, ["status", "--json"])[1])["changes"]
         self.assertEqual([c["version"] for c in changes], ["1.4.238", "1.4.239"])
         self.assertEqual(changes[1]["notes"], ["Chat: Restart chats."])
+        self.assertEqual([(x["name"], len(x["items"])) for x in changes[1]["sections"]],
+                         [("Terminals", 2), ("Tests, builds & maintenance", 1)])
         self.assertNotIn("changes an update", run(env, ["status", "--no-changes"])[1])
         rc, out = run(FakeEnv([FakeServer("a", "1.4.239")]), ["status"])
         self.assertNotIn("changes an update", out)

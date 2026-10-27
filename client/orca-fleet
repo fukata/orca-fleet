@@ -192,26 +192,60 @@ def resolve_target(env: Env, version: str, stable: dict[str, dict] | None = None
     return {"version": version, "latest": latest, "published_at": stable[version].get("published_at")}
 
 
+SUMMARY_SECTIONS = {"the short version", "compatibility & upgrade notes", "product experience"}
+SKIP_SECTIONS = {"new contributors"}
+PR_CREDIT_RE = re.compile(r"\s+by @[\w.-]+(?:,? (?:and )?@[\w.-]+)* in https://github\.com/\S+/pull/(\d+)\s*$")
+
+
+def is_maintenance(name: str) -> bool:
+    n = name.lower()
+    return "maintenance" in n or "groundwork" in n
+
+
 def parse_release_notes(body: str) -> dict:
-    """Pull the title, "The short version" bullets and the upgrade notes out of an Orca release body."""
-    title, section, highlights, notes, other = None, None, [], [], []
+    """Split an Orca release body into its title, "The short version", upgrade notes and per-area changes.
+
+    Orca bodies are: `## <title>`, `## The short version`, `## Compatibility & upgrade notes`, then
+    `## Product experience` with one `### <area>` (an italic one-line gist + PR bullets) per area.
+    """
+    title, h2, sec = None, None, None
+    highlights, notes, sections = [], [], []
     for raw in (body or "").splitlines():
         line = raw.strip()
         if line.startswith("## "):
-            heading = line[3:].strip()
-            section = heading.lower()
-            title = title or heading
+            h2, sec = line[3:].strip(), None
+            if title is None and h2.lower() not in SUMMARY_SECTIONS | SKIP_SECTIONS:
+                title = h2
+            elif h2.lower() not in SUMMARY_SECTIONS | SKIP_SECTIONS:
+                sec = {"name": h2, "summary": None, "items": []}
+                sections.append(sec)
             continue
-        if not line.startswith(("- ", "* ")):
+        if line.startswith("### "):
+            sec = {"name": line[4:].strip(), "summary": None, "items": []}
+            if (h2 or "").lower() not in SKIP_SECTIONS:
+                sections.append(sec)
             continue
-        item = re.sub(r"\*\*(.+?)\*\*", r"\1", line[2:]).strip()
-        if section == "the short version":
-            highlights.append(item)
-        elif section and section.startswith("compatibility"):
-            notes.append(item)
-        else:
-            other.append(item)
-    return {"title": title, "highlights": highlights or other[:8], "notes": notes}
+        h2l = (h2 or "").lower()
+        if not line or line.startswith("<") or h2l in SKIP_SECTIONS:
+            continue
+        bullet = line.startswith(("- ", "* "))
+        item = re.sub(r"\*\*(.+?)\*\*", r"\1", line[2:] if bullet else line).strip()
+        item = PR_CREDIT_RE.sub(r" (#\1)", item)
+        if h2l == "the short version":
+            if bullet or line.startswith("**"):  # also the "**Phone & web updates:** ..." paragraph
+                highlights.append(item)
+        elif h2l.startswith("compatibility"):
+            if bullet:
+                notes.append(item)
+        elif sec is not None:
+            if bullet:
+                sec["items"].append(item)
+            elif re.fullmatch(r"\*[^*].*\*|_[^_].*_", line) and sec["summary"] is None:
+                sec["summary"] = line[1:-1].strip()
+        elif bullet:
+            highlights.append(item)  # unstructured body: keep every bullet
+    return {"title": title, "highlights": highlights, "notes": notes,
+            "sections": [x for x in sections if x["items"] or x["summary"]]}
 
 
 def release_changes(stable: dict[str, dict], rows: list[dict], target: str) -> list[dict]:
@@ -228,7 +262,7 @@ def release_changes(stable: dict[str, dict], rows: list[dict], target: str) -> l
     return changes
 
 
-def print_changes(changes: list[dict]) -> None:
+def print_changes(changes: list[dict], detail: str = "full") -> None:
     print("\nchanges an update would bring:")
     for c in changes:
         print(f"\n  {c['version']} ({(c['published_at'] or '?')[:10]}; missing on {', '.join(c['servers'])})"
@@ -239,6 +273,14 @@ def print_changes(changes: list[dict]) -> None:
             print("    upgrade notes:")
             for n in c["notes"]:
                 print(f"    ! {n}")
+        if detail == "full":
+            for sec in c["sections"]:
+                if is_maintenance(sec["name"]):
+                    print(f"    [{sec['name']}] {len(sec['items'])} item(s) omitted (see --json or the release page)")
+                    continue
+                print(f"    [{sec['name']}]" + (f" {sec['summary']}" if sec["summary"] else ""))
+                for it in sec["items"]:
+                    print(f"      * {it}")
         if c["url"]:
             print(f"    {c['url']}")
 
@@ -443,8 +485,9 @@ def cmd_status(env: Env, args) -> int:
     print_table(rows, ["server", "connected", "installed_version", "needs_update", "service",
                        "agents", "busy_agents", "update_state", "error"])
     print(f"\n{drift_line(drift)}")
-    if changes and not args.no_changes:
-        print_changes(changes)
+    detail = "none" if args.no_changes else args.changes
+    if changes and detail != "none":
+        print_changes(changes, detail)
     return rc
 
 
@@ -937,8 +980,10 @@ def build_parser() -> argparse.ArgumentParser:
     stp = common(sub.add_parser("status", help="versions, service and agent state of every server"))
     stp.add_argument("--check", action="store_true",
                      help="exit 1 unless every server is reachable and at the target version")
-    stp.add_argument("--no-changes", action="store_true",
-                     help="do not summarize the release notes of versions behind servers are missing")
+    stp.add_argument("--changes", choices=["full", "short", "none"], default="full",
+                     help="release notes of versions behind servers are missing: full (every area), "
+                          "short (highlights + upgrade notes) or none")
+    stp.add_argument("--no-changes", action="store_true", help="same as --changes none")
     pl = common(sub.add_parser("plan", help="show what an update would do (read-only)"), mode=True)
     pl.add_argument("--needs-action", action="store_true",
                     help="exit 0 only if a server needs update or recovery (unreachable/skip -> 1)")

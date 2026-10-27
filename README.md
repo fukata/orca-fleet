@@ -229,8 +229,9 @@ orca-fleet discover --write    # ~/.config/orca-fleet/config.json
 
 ```bash
 orca-fleet status                       # 全サーバーの状態とバージョン、バージョンのずれ (fleet 行)
-                                        # 遅れているサーバーがあれば、未適用リリースの変更点 (The short version /
-                                        # Compatibility & upgrade notes) を古い順に要約表示 (--no-changes で非表示)
+                                        # 遅れているサーバーがあれば、未適用リリースの変更点を古い順に表示:
+                                        # The short version / Compatibility & upgrade notes / 分野別の全変更 (PR番号付き)
+                                        # (maintenance は件数のみ。--changes short で要約のみ、--no-changes で非表示)
 orca-fleet status --check               # 全台が到達可能かつターゲット版なら exit 0、ずれがあれば exit 1
 orca-fleet plan [--version 1.4.239]     # 更新計画 (read-only)
 orca-fleet update --dry-run             # 取得予定のみ表示
