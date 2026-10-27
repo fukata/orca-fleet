@@ -176,6 +176,32 @@ class ClientTests(unittest.TestCase):
         fl = json.loads(out)["fleet"]
         self.assertEqual((fl["behind"], fl["consistent"]), (["a"], False))
 
+    def test_status_summarizes_missing_releases(self):
+        body = ("## Faster and safer\n\nIntro.\n\n## The short version\n\n- **Speed:** Terminals are faster.\n"
+                "- **Fixes:** Many fixes.\n\n## Compatibility & upgrade notes\n\n- **Chat:** Restart chats.\n")
+        rels = [{"tag_name": "v1.4.239", "prerelease": False, "draft": False, "published_at": "2026-10-02T00:00:00Z",
+                 "html_url": "https://example/v1.4.239", "body": body},
+                {"tag_name": "v1.4.238", "prerelease": False, "draft": False, "published_at": "2026-10-01T00:00:00Z",
+                 "body": "Plain notes\n- one fix\n"},
+                {"tag_name": "v1.4.237", "prerelease": False, "draft": False, "published_at": "x", "body": "- old\n"}]
+        env = FakeEnv([FakeServer("a", "1.4.237"), FakeServer("b", "1.4.238")])
+        env.releases = lambda: rels
+        rc, out = run(env, ["status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1.4.238 (2026-10-01; missing on a)", out)
+        self.assertIn("1.4.239 (2026-10-02; missing on a, b)  Faster and safer", out)
+        self.assertIn("    - Speed: Terminals are faster.", out)
+        self.assertIn("    - one fix", out)
+        self.assertIn("    ! Chat: Restart chats.", out)
+        self.assertNotIn("- old", out)
+        self.assertLess(out.index("  1.4.238 ("), out.index("  1.4.239 ("))
+        changes = json.loads(run(env, ["status", "--json"])[1])["changes"]
+        self.assertEqual([c["version"] for c in changes], ["1.4.238", "1.4.239"])
+        self.assertEqual(changes[1]["notes"], ["Chat: Restart chats."])
+        self.assertNotIn("changes an update", run(env, ["status", "--no-changes"])[1])
+        rc, out = run(FakeEnv([FakeServer("a", "1.4.239")]), ["status"])
+        self.assertNotIn("changes an update", out)
+
     def test_drift_prefers_version_seen_over_orca(self):
         s = FakeServer("a", "1.4.239")
         s.client_sees = "1.4.229"  # package installed but the running serve is still old

@@ -169,13 +169,17 @@ def select_servers(cfg: dict, names: list[str] | None) -> list[dict]:
 
 
 # --- release resolution -----------------------------------------------------
-def resolve_target(env: Env, version: str) -> dict:
-    rels = env.releases()
+def stable_releases(env: Env) -> dict[str, dict]:
     stable = {}
-    for r in rels:
+    for r in env.releases():
         m = STABLE_TAG_RE.match(r.get("tag_name", ""))
         if m and VERSION_RE.match(m.group(1)) and not r.get("prerelease") and not r.get("draft"):
             stable[m.group(1)] = r
+    return stable
+
+
+def resolve_target(env: Env, version: str, stable: dict[str, dict] | None = None) -> dict:
+    stable = stable_releases(env) if stable is None else stable
     if not stable:
         raise SystemExit("no stable Orca release found on GitHub")
     latest = max(stable, key=vt)
@@ -186,6 +190,57 @@ def resolve_target(env: Env, version: str) -> dict:
     if version not in stable:
         raise SystemExit(f"{version} is not a stable official release (prereleases are refused)")
     return {"version": version, "latest": latest, "published_at": stable[version].get("published_at")}
+
+
+def parse_release_notes(body: str) -> dict:
+    """Pull the title, "The short version" bullets and the upgrade notes out of an Orca release body."""
+    title, section, highlights, notes, other = None, None, [], [], []
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            section = heading.lower()
+            title = title or heading
+            continue
+        if not line.startswith(("- ", "* ")):
+            continue
+        item = re.sub(r"\*\*(.+?)\*\*", r"\1", line[2:]).strip()
+        if section == "the short version":
+            highlights.append(item)
+        elif section and section.startswith("compatibility"):
+            notes.append(item)
+        else:
+            other.append(item)
+    return {"title": title, "highlights": highlights or other[:8], "notes": notes}
+
+
+def release_changes(stable: dict[str, dict], rows: list[dict], target: str) -> list[dict]:
+    """Stable releases in (server version, target] for every server behind the target, oldest first."""
+    have = {r["server"]: v for r in rows
+            if (v := r.get("orca_version") or r.get("installed_version")) and VERSION_RE.match(v)
+            and vt(v) < vt(target)}
+    changes = []
+    for v in sorted((v for v in stable if any(vt(h) < vt(v) <= vt(target) for h in have.values())), key=vt):
+        rel = stable[v]
+        changes.append({"version": v, "published_at": rel.get("published_at"), "url": rel.get("html_url"),
+                        "servers": [n for n, h in have.items() if vt(h) < vt(v)],
+                        **parse_release_notes(rel.get("body") or "")})
+    return changes
+
+
+def print_changes(changes: list[dict]) -> None:
+    print("\nchanges an update would bring:")
+    for c in changes:
+        print(f"\n  {c['version']} ({(c['published_at'] or '?')[:10]}; missing on {', '.join(c['servers'])})"
+              + (f"  {c['title']}" if c["title"] else ""))
+        for h in c["highlights"]:
+            print(f"    - {h}")
+        if c["notes"]:
+            print("    upgrade notes:")
+            for n in c["notes"]:
+                print(f"    ! {n}")
+        if c["url"]:
+            print(f"    {c['url']}")
 
 
 # --- per-server probes ------------------------------------------------------
@@ -369,22 +424,27 @@ def cmd_discover(env: Env, args) -> int:
 
 def cmd_status(env: Env, args) -> int:
     servers = select_servers(env.cfg, args.server)
-    target = None
+    target, stable = None, {}
     try:
-        target = resolve_target(env, args.version)
+        stable = stable_releases(env)
+        target = resolve_target(env, args.version, stable)
     except (SystemExit, urllib.error.URLError, OSError) as e:
         eprint(f"warning: cannot resolve target release: {e}")
     rows = [summarize(p, target and target["version"]) for p in probe_all(env, servers)]
     drift = fleet_drift(rows, target and target["version"])
+    changes = release_changes(stable, rows, target["version"]) if target and drift["behind"] else []
     rc = 1 if args.check and not drift["consistent"] else 0
     if args.json:
-        print(json.dumps({"target": target, "servers": rows, "fleet": drift}, indent=2, ensure_ascii=False))
+        print(json.dumps({"target": target, "servers": rows, "fleet": drift, "changes": changes},
+                         indent=2, ensure_ascii=False))
         return rc
     if target:
         print(f"target: {target['version']} (latest stable {target['latest']}, published {target['published_at']})\n")
     print_table(rows, ["server", "connected", "installed_version", "needs_update", "service",
                        "agents", "busy_agents", "update_state", "error"])
     print(f"\n{drift_line(drift)}")
+    if changes and not args.no_changes:
+        print_changes(changes)
     return rc
 
 
@@ -877,6 +937,8 @@ def build_parser() -> argparse.ArgumentParser:
     stp = common(sub.add_parser("status", help="versions, service and agent state of every server"))
     stp.add_argument("--check", action="store_true",
                      help="exit 1 unless every server is reachable and at the target version")
+    stp.add_argument("--no-changes", action="store_true",
+                     help="do not summarize the release notes of versions behind servers are missing")
     pl = common(sub.add_parser("plan", help="show what an update would do (read-only)"), mode=True)
     pl.add_argument("--needs-action", action="store_true",
                     help="exit 0 only if a server needs update or recovery (unreachable/skip -> 1)")

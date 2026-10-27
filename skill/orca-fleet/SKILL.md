@@ -19,6 +19,7 @@ Never run bare `orca` on Linux (GNOME screen reader). The tools use `orca-ide`.
 | --- | --- |
 | バージョンを確認 / status | `orca-fleet status` |
 | バージョンが揃っているか / 未更新のサーバーは | `orca-fleet status` (the `fleet:` line; `--check` exits 1 on drift) |
+| 更新で何が変わるか / 変更内容 | `orca-fleet status` (the `changes an update would bring:` section summarizes each missing release; JSON: `changes`) |
 | 更新できるサーバーを一覧 | `orca-fleet plan` (add `--version X.Y.Z` for a specific release) |
 | 何が起きるか確認だけ | `orca-fleet update --dry-run` |
 | 同じバージョンに揃えて / 最新安定版に揃えて | plan → approval → `orca-fleet update --yes [--track]` (**mutating**) |
