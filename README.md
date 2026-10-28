@@ -11,6 +11,7 @@
   - 公式リリースの取得と検証を行います。
   - 更新処理は transient systemd unit に引き渡して実行します。
   - 状態の永続化、監査ログ、ロールバック、中断からの復旧を担います。
+  - `--desktop` で導入すると、サーバーではなくこのマシンの .deb 版デスクトップアプリを更新対象にします（[デスクトップ版](#このマシンのデスクトップ版)）。
 - **`skill/orca-fleet`**: Orca 上の Claude から自然言語で操作するためのスキルです。
 
 ---
@@ -203,6 +204,28 @@ ssh dev 'sudo -n /usr/local/sbin/orca-serve-update --json status'               
 - 該当するユニットが複数ある場合は `--service` で指定します。
 - linger が無効な場合は警告を出します。
 
+### このマシンのデスクトップ版
+
+クライアントを動かしているマシンの Orca デスクトップ版も、同じヘルパーで更新できます。対応しているのは .deb 版（`/opt/Orca/orca-ide`）だけです。AppImage など別の方法で入れた場合は、`init` が `discovery_failed` で止まります。
+
+```bash
+sudo server/install.sh --desktop           # sudo を実行したユーザーのアプリが対象（--user で変更可）
+orca-fleet discover --write                # "local" エントリ ({"name": "local", "local": true}) が追加される
+orca-fleet plan --all                      # local 行の action を確認
+orca-fleet update --all                    # リモートのサーバーを更新したあと、最後にデスクトップ版を更新
+```
+
+- 設定は `{"kind": "desktop", "service_user": <user>, "cli": "/usr/bin/orca-ide", "app": "/opt/Orca/orca-ide"}` です。
+- 対象ユーザーは orca-updaters グループに入り、sudoers にもユーザー単位の行が追加されます。再ログインしなくても `sudo -n` で使えます。
+- 更新の流れは、サーバー版と同じ transient systemd unit の中で次のように進みます。
+  1. SAFE の事前確認（エージェントの作業状況、PTY デーモンのプロトコル互換）。デスクトップ版はユーザーのセッションの中で動くので、linger は要求しません。
+  2. アプリのメインプロセスに SIGTERM を送ります。`app_stop_timeout_seconds`（既定 60 秒）を過ぎても終わらなければ SIGKILL を送ります。PTY デーモンは別の scope にあるため、シグナルは届きません。
+  3. `dpkg -i` を実行します。
+  4. 更新前にアプリが起動していた場合は、`systemd-run --user` でユーザーのセッションにアプリを起動し直します。起動していなかった場合は閉じたままにし、パッケージのバージョンだけを確認します。
+  5. CLI でランタイムのバージョンを確認し、安定期間のあいだメインプロセスが変わらないことも確認します。失敗した場合は旧版に戻して、アプリを起動し直します。
+- `update` / `retry` / `plan` は、`--all` か `--server local` を指定したときだけ local を対象にします。それ以外では `skip (local desktop; pass --all)` と表示します。local の更新は、ほかのすべてのサーバー（control も含む）より後に行います。
+- sudo-rs（Ubuntu 26.04 以降の既定）は、引数の途中にあるワイルドカードを受け付けません。そのため、sudo-rs のときは `_worker` / `init` の拒否ルールを省きます。許可しているコマンドはどれも `--json` の直後のサブコマンドが固定されているので、拒否ルールがなくても `_worker` や `init` は実行できません。
+
 ### クライアント
 
 ```bash
@@ -243,6 +266,8 @@ orca-fleet retry                        # failed / rolled_back / deferred のサ
 orca-fleet rollback --server dev [--to 1.4.229]
 orca-fleet recover --server dev         # 中断した操作の整合
 orca-fleet update --yes --track         # (Orca ターミナル内) Run/Task に記録
+orca-fleet update --all                 # このマシンのデスクトップ版も含めて全部 (local は最後)
+orca-fleet --self-update update --all   # ツールとヘルパーを更新してから、デスクトップ版も含めて全部更新
 ```
 
 ### ツール自身の更新（self-update）
@@ -374,6 +399,7 @@ E2E の途中で、ユニットテストでは見つからなかったバグを2
 - Android からの操作
 - `dpkg` 実行中にプロセスを強制終了された場合（パッケージが中途半端な状態になったとき。`recover` で `dpkg -i` を再実行して修復する設計です）
 - arm64 環境
+- デスクトップ版の実機での更新（SIGTERM で終了したあとも、ターミナルとエージェントが PTY デーモン上で生き続けること）。終了後に PTY scope が消えた場合は、`pty_sessions_lost` として記録されます。
 
 ## 10. 運用・復旧手順
 

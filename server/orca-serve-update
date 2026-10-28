@@ -1,7 +1,9 @@
 #!/usr/bin/python3 -I
 """orca-serve-update: server-side updater for a systemd-managed `orca serve`.
 
-Runs on each Linux server. Privileged subcommands (prepare/apply/rollback/
+Runs on each Linux server. With `"kind": "desktop"` in its config it instead
+updates the .deb-installed Orca desktop app of one user: the app is quit, the
+package switched, and the app relaunched in that user's graphical session. Privileged subcommands (prepare/apply/rollback/
 recover/init) must run as root (normally via a narrow sudoers rule). The actual
 package switch runs in a transient systemd unit started with systemd-run, so it
 keeps going when the SSH session, the Orca worker, or the client disconnects —
@@ -25,6 +27,7 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -53,6 +56,7 @@ MAX_DEB_BYTES = 600 * 1024 * 1024
 
 VERSION_RE = re.compile(r"^(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})\Z")
 STABLE_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)\Z")
+KINDS = {"serve", "desktop"}
 UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,200}\.service\Z")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 OP_ID_RE = re.compile(r"^[0-9a-f]{12}\Z")
@@ -77,6 +81,7 @@ PATHS = {
     "self": "/usr/local/sbin/orca-serve-update",
 }
 WORKER_UNIT = "orca-serve-update-worker.service"
+DESKTOP_APP = "/opt/Orca/orca-ide"
 
 TERMINAL_RESULTS = {"succeeded", "skipped", "deferred", "rolled_back", "failed", "rollback_failed"}
 
@@ -322,20 +327,31 @@ class Updater:
 
     @staticmethod
     def _validate_config(cfg: dict) -> dict:
-        unit = cfg.get("service", "")
+        kind = cfg.get("kind", "serve")
+        if kind not in KINDS:
+            raise UpdateError("bad_config", f"invalid kind {kind!r}")
         user = cfg.get("service_user", "")
-        if not UNIT_RE.match(unit):
-            raise UpdateError("bad_config", f"invalid service unit name {unit!r}")
         if not USER_RE.match(user):
             raise UpdateError("bad_config", f"invalid service user {user!r}")
-        port = int(cfg.get("port") or 0)
-        if not 0 < port < 65536:
-            raise UpdateError("bad_config", "invalid port")
         cli = cfg.get("cli", "/usr/bin/orca-ide")
         if not os.path.isabs(cli):
             raise UpdateError("bad_config", "cli must be an absolute path")
         out = dict(cfg)
-        out.update(service=unit, service_user=user, port=port, cli=cli)
+        out.update(kind=kind, service_user=user, cli=cli)
+        if kind == "serve":
+            unit = cfg.get("service", "")
+            if not UNIT_RE.match(unit):
+                raise UpdateError("bad_config", f"invalid service unit name {unit!r}")
+            port = int(cfg.get("port") or 0)
+            if not 0 < port < 65536:
+                raise UpdateError("bad_config", "invalid port")
+            out.update(service=unit, port=port)
+        else:
+            app = cfg.get("app", DESKTOP_APP)
+            if not os.path.isabs(app):
+                raise UpdateError("bad_config", "app must be an absolute path")
+            out["app"] = app
+            out.setdefault("app_stop_timeout_seconds", 60)
         out.setdefault("safe_idle_seconds", 120)
         out.setdefault("verify_timeout_seconds", 120)
         out.setdefault("stability_seconds", 15)
@@ -347,6 +363,10 @@ class Updater:
                 raise UpdateError("bad_config", "self_update needs {\"repo\": \"owner/name\", \"ref\": \"branch\"}")
             out["self_update"] = {"repo": su["repo"], "ref": su.get("ref", "main")}
         return out
+
+    @property
+    def desktop(self) -> bool:
+        return self.config()["kind"] == "desktop"
 
     def _check_root(self) -> None:
         if self.require_root and os.geteuid() != 0:
@@ -400,6 +420,10 @@ class Updater:
         return ver if VERSION_RE.match(ver) else ver or None
 
     def service_state(self) -> dict:
+        if self.desktop:
+            pid = self.desktop_app_pid()
+            return {"kind": "desktop", "ActiveState": "active" if pid else "inactive",
+                    "SubState": "running" if pid else "dead", "MainPID": pid or 0, "NRestarts": 0}
         unit = self.config()["service"]
         cp = self.runner.run(["systemctl", "show", unit, "--no-pager",
                               "-p", "ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestamp,ExecMainStatus,Result"])
@@ -415,6 +439,8 @@ class Updater:
         return out
 
     def port_listening(self) -> bool:
+        if self.desktop:
+            return True  # the desktop runtime has no TCP port; reachability is checked over the CLI
         port = self.config()["port"]
         cp = self.runner.run(["ss", "-H", "-ltn", f"sport = :{port}"])
         return cp.returncode == 0 and bool(cp.stdout.strip())
@@ -424,7 +450,8 @@ class Updater:
         pw = pwd.getpwnam(user)
         prefix = ["runuser", "-u", user, "--"] if os.geteuid() == 0 else []
         env = {"HOME": pw.pw_dir, "USER": user, "LOGNAME": user,
-               "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}"}
+               "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}",
+               "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{pw.pw_uid}/bus"}
         return prefix, env
 
     def orca_cli_json(self, args: list[str], timeout: float = 30) -> dict | None:
@@ -573,6 +600,71 @@ class Updater:
     def pids_alive(self, pids: list[int]) -> list[int]:
         return [p for p in pids if os.path.exists(f"/proc/{p}")]
 
+    # ---------- desktop app (kind: desktop) ----------
+    def desktop_app_pid(self, proc: str = "/proc") -> int | None:
+        """Main process of the user's Orca desktop app.
+
+        Electron helpers (--type=...), the PTY daemon and the session scanner run the
+        same executable with a script or --type argument; the main process has neither.
+        """
+        app = os.path.realpath(self.config()["app"])
+        uid = pwd.getpwnam(self.config()["service_user"]).pw_uid
+        found = []
+        for name in os.listdir(proc):
+            if not name.isdigit():
+                continue
+            try:
+                if os.stat(f"{proc}/{name}").st_uid != uid:
+                    continue
+                with open(f"{proc}/{name}/cmdline", "rb") as f:
+                    argv = f.read().decode("utf-8", "replace").split("\0")
+            except OSError:
+                continue
+            if not argv or os.path.realpath(argv[0]) != app:
+                continue
+            if any(a.startswith("--type=") or a.endswith(".js") for a in argv[1:]):
+                continue
+            found.append(int(name))
+        return min(found) if found else None
+
+    def signal_pid(self, pid: int, sig: int) -> None:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def stop_desktop_app(self, st: dict) -> None:
+        """Quit the app the way a session logout does (SIGTERM), SIGKILL if it hangs.
+
+        The PTY daemon runs in its own scope and is not signalled, so terminals keep running.
+        """
+        pid = self.desktop_app_pid()
+        if not pid:
+            return
+        self.signal_pid(pid, signal.SIGTERM)
+        deadline = self.clock() + self.config()["app_stop_timeout_seconds"]
+        while self.clock() < deadline:
+            if self.desktop_app_pid() != pid:
+                return
+            self.sleep(1)
+        st["app_killed"] = pid
+        self.signal_pid(pid, signal.SIGKILL)
+        for _ in range(10):
+            if self.desktop_app_pid() != pid:
+                return
+            self.sleep(1)
+        raise UpdateError("stop_failed", f"Orca desktop app (pid {pid}) did not exit")
+
+    def start_desktop_app(self, op_id: str) -> None:
+        """Relaunch the app in the user's systemd manager, which carries the session's display env."""
+        prefix, env = self._user_env()
+        unit = f"app-orca-ide-{op_id}-{uuid.uuid4().hex[:6]}"
+        cp = self.runner.run(prefix + ["systemd-run", "--user", "--collect", "--quiet", "--slice=app.slice",
+                                       f"--unit={unit}", "--description=Orca (relaunched by orca-serve-update)",
+                                       self.config()["app"]], timeout=60, env=env)
+        if cp.returncode != 0:
+            raise UpdateError("start_failed", f"cannot relaunch the Orca desktop app: {cp.stderr.strip()[:300]}")
+
     # ---------- install-target sanity ----------
     def check_install_target(self) -> dict:
         """Verify ownership/permissions of the package install (anti-tamper)."""
@@ -688,8 +780,11 @@ class Updater:
         out: dict = {"host": socket.gethostname(), "tool_version": TOOL_VERSION, "ts": now_iso()}
         try:
             cfg = self.config()
-            out["service"] = {"unit": cfg["service"], "user": cfg["service_user"], "port": cfg["port"],
-                              **self.service_state(), "listening": self.port_listening()}
+            if self.desktop:
+                out["service"] = {"user": cfg["service_user"], "app": cfg["app"], **self.service_state()}
+            else:
+                out["service"] = {"unit": cfg["service"], "user": cfg["service_user"], "port": cfg["port"],
+                                  **self.service_state(), "listening": self.port_listening()}
         except UpdateError as e:
             out["config_error"] = e.message
             cfg = None
@@ -836,9 +931,10 @@ class Updater:
                 report["warnings"].append(f"{len(act['blocked'])} agent(s) waiting for permission (not blocking)")
         has_sessions = bool(daemons) or bool(act.get("live_terminals"))
         if has_sessions:
-            linger = self.linger_enabled()
+            # the desktop app's daemon lives in the logged-in user's manager, not a system service
+            linger = None if self.desktop else self.linger_enabled()
             report["linger"] = linger
-            if linger is not True:
+            if linger is not True and not self.desktop:
                 block.append("user lingering is not enabled: the PTY daemon would die with the service" + suffix)
             meta = read_json(self.meta_path(version, arch)) or {}
             facts = meta.get("daemon_protocol")
@@ -1097,30 +1193,41 @@ class Updater:
         current = self.installed_version()
         st = self._new_op(op_id, "recover", target=target, previous=previous, mode="recover",
                           interrupted=prev.get("op_id"), interrupted_phase=prev.get("phase"))
+        if self.desktop:
+            # the app may be down mid-switch; bring it back unless it was not running to begin with
+            st["app_was_running"] = prev.get("app_was_running", True)
         if prev.get("op") == "rollback":
             # interrupted manual rollback: the intended end state is `target`
             previous = target
         try:
             if current and target and current == target and prev.get("op") != "rollback":
                 # package switched; check health, keep it if healthy
-                self._ensure_started()
+                self._ensure_started(st)
                 self._verify(st, target)
                 return self._finish(st, "succeeded", note="interrupted update completed on recovery")
         except UpdateError as e:
             st["error"] = f"{e.code}: {e.message}"
         return self._rollback_after_failure(st, previous, arch)
 
-    def _ensure_started(self) -> None:
+    def _ensure_started(self, st: dict) -> None:
+        if self.desktop:
+            if st.get("app_was_running") and not self.desktop_app_pid():
+                self.start_desktop_app(st["op_id"])
+            return
         unit = self.config()["service"]
         self.runner.run(["systemctl", "start", unit], timeout=90)
 
     def _switch(self, st: dict, version: str, arch: str, rollback: bool = False) -> None:
-        unit = self.config()["service"]
         meta = self.verify_cached(version, arch)
-        self.set_phase(st, "stopping_service", switching_to=version)
-        cp = self.runner.run(["systemctl", "stop", unit], timeout=120)
-        if cp.returncode != 0:
-            raise UpdateError("stop_failed", cp.stderr.strip()[:300])
+        if self.desktop:
+            st.setdefault("app_was_running", bool(self.desktop_app_pid()))
+            self.set_phase(st, "stopping_app", switching_to=version)
+            self.stop_desktop_app(st)
+        else:
+            self.set_phase(st, "stopping_service", switching_to=version)
+            cp = self.runner.run(["systemctl", "stop", self.config()["service"]], timeout=120)
+            if cp.returncode != 0:
+                raise UpdateError("stop_failed", cp.stderr.strip()[:300])
         self.set_phase(st, "installing", switching_to=version)
         cp = self.runner.run(["dpkg", "-i", "--force-downgrade" if rollback else "--refuse-downgrade",
                               self.cache_path(version, arch)], timeout=600,
@@ -1129,8 +1236,14 @@ class Updater:
         if cp.returncode != 0 or installed != version:
             st["dpkg_output"] = (cp.stdout + cp.stderr)[-2000:]
             # bring the service back with whatever is installed before reporting
-            self.runner.run(["systemctl", "start", unit], timeout=90)
+            self._ensure_started(st)
             raise UpdateError("install_failed", f"dpkg -i {version} failed (installed now: {installed})")
+        if self.desktop:
+            self.set_phase(st, "starting_app", switching_to=version, sha256=meta["sha256"])
+            if st["app_was_running"]:
+                self.start_desktop_app(st["op_id"])
+            return
+        unit = self.config()["service"]
         self.set_phase(st, "starting_service", switching_to=version, sha256=meta["sha256"])
         self.runner.run(["systemctl", "reset-failed", unit])
         cp = self.runner.run(["systemctl", "start", unit], timeout=120)
@@ -1140,6 +1253,14 @@ class Updater:
     def _verify(self, st: dict, version: str) -> None:
         cfg = self.config()
         self.set_phase(st, "verifying", expecting=version)
+        if self.desktop and not st.get("app_was_running"):
+            # the app was not running before, so it stays closed: the package is all there is to check
+            installed = self.installed_version()
+            st["verify"] = {"installed_version": installed, "app_running": False}
+            if installed != version:
+                raise UpdateError("verify_failed", f"installed version is {installed}, expected {version}")
+            self.save_state(st)
+            return
         deadline = self.clock() + cfg["verify_timeout_seconds"]
         last: dict = {}
         while self.clock() < deadline:
@@ -1152,11 +1273,11 @@ class Updater:
                 break
             if svc.get("ActiveState") == "failed":
                 st["verify"] = last
-                raise UpdateError("service_failed", f"{cfg['service']} entered failed state")
+                raise UpdateError("service_failed", f"{cfg.get('service')} entered failed state")
             self.sleep(3)
         else:
             st["verify"] = last
-            raise UpdateError("verify_timeout", f"service not healthy at {version} within "
+            raise UpdateError("verify_timeout", f"{'app' if self.desktop else 'service'} not healthy at {version} within "
                                                 f"{cfg['verify_timeout_seconds']}s")
         pid, restarts = last["service"]["MainPID"], last["service"].get("NRestarts")
         self.sleep(cfg["stability_seconds"])
@@ -1168,9 +1289,9 @@ class Updater:
         self.save_state(st)
 
     # ---------- init (discovery of the existing service) ----------
-    def cmd_init(self, service: str | None, write: bool) -> dict:
+    def cmd_init(self, service: str | None, write: bool, desktop: bool = False, user: str | None = None) -> dict:
         self._check_root()
-        found = self.discover_service(service)
+        found = self.discover_desktop(user) if desktop else self.discover_service(service)
         if write:
             self.init_dirs()
             existing = read_json(self.paths["config"]) or {}
@@ -1212,8 +1333,23 @@ class Updater:
         if "--port" in argv and argv.index("--port") + 1 < len(argv):
             port = int(argv[argv.index("--port") + 1])
         cli = argv[0] if argv and os.path.isabs(argv[0]) else "/usr/bin/orca-ide"
-        return {"service": unit, "service_user": user, "port": port, "cli": cli,
+        return {"kind": "serve", "service": unit, "service_user": user, "port": port, "cli": cli,
                 "exec_start": " ".join(argv), "unit_file": props.get("FragmentPath")}
+
+    def discover_desktop(self, user: str | None) -> dict:
+        """The .deb desktop install of one user (the sudo caller unless --user is given)."""
+        user = user or os.environ.get("SUDO_USER") or ""
+        if not USER_RE.match(user) or user == "root":
+            raise UpdateError("discovery_failed", f"cannot tell whose desktop app to update (got {user!r}); pass --user")
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            raise UpdateError("discovery_failed", f"no such user {user!r}") from None
+        cp = self.runner.run(["dpkg-query", "-L", PACKAGE_NAME])
+        if cp.returncode != 0 or DESKTOP_APP not in cp.stdout.splitlines():
+            raise UpdateError("discovery_failed", f"{PACKAGE_NAME} .deb is not installed (no {DESKTOP_APP}); "
+                                                  "other install methods are not supported")
+        return {"kind": "desktop", "service_user": user, "cli": "/usr/bin/orca-ide", "app": DESKTOP_APP}
 
 
 # --- CLI --------------------------------------------------------------------
@@ -1238,8 +1374,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("recover", help="reconcile an interrupted operation (root)")
     su = sub.add_parser("self-update", help="replace this helper from the configured repo/ref (root)")
     su.add_argument("--dry-run", action="store_true")
-    ini = sub.add_parser("init", help="discover the orca serve unit and write the config (root)")
+    ini = sub.add_parser("init", help="discover the orca serve unit (or desktop app) and write the config (root)")
     ini.add_argument("--service")
+    ini.add_argument("--desktop", action="store_true", help="update the .deb desktop app instead of orca serve")
+    ini.add_argument("--user", help="desktop owner (default: the sudo caller)")
     ini.add_argument("--write", action="store_true")
     w = sub.add_parser("_worker", help=argparse.SUPPRESS)
     w.add_argument("kind", choices=["update", "rollback", "recover"])
@@ -1270,7 +1408,7 @@ def main(argv: list[str] | None = None, updater: Updater | None = None) -> int:
         elif args.cmd == "self-update":
             out = u.cmd_self_update(args.dry_run)
         elif args.cmd == "init":
-            out = u.cmd_init(args.service, args.write)
+            out = u.cmd_init(args.service, args.write, args.desktop, args.user)
         elif args.cmd == "_worker":
             if not os.environ.get("INVOCATION_ID"):
                 raise UpdateError("not_in_systemd", "_worker must run inside the systemd unit")
