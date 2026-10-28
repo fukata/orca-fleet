@@ -23,6 +23,7 @@ Never run bare `orca` on Linux (GNOME screen reader). The tools use `orca-ide`.
 | 更新できるサーバーを一覧 | `orca-fleet plan` (add `--version X.Y.Z` for a specific release) |
 | 何が起きるか確認だけ | `orca-fleet update --dry-run` |
 | 同じバージョンに揃えて / 最新安定版に揃えて | plan → approval → `orca-fleet update --yes [--track]` (**mutating**) |
+| 自身（このマシンのデスクトップ版）も含めてすべて更新 | `orca-fleet plan --all` → approval → `orca-fleet update --all --yes` (**mutating**; add `--self-update` to refresh the tool and helpers first) |
 | エージェント実行中はスキップ | default SAFE mode already defers those servers; say so |
 | 空くまで待ってから更新 | add `--wait-idle 1800` |
 | 失敗したサーバーを確認 | `orca-fleet progress` |
@@ -30,6 +31,17 @@ Never run bare `orca` on Linux (GNOME screen reader). The tools use `orca-ide`.
 | ロールバック | `orca-fleet rollback --server NAME --dry-run`, then approval, then `--yes` (**mutating**) |
 | 中断された更新の復旧 | `orca-fleet recover --server NAME` (**mutating**) |
 | サーバーの追加・確認 | `orca-fleet discover` (`--write` updates the config) |
+
+## This machine's desktop app
+
+A `"local": true` server entry is this machine's .deb desktop Orca, managed by the same helper
+installed with `sudo server/install.sh --desktop`. Without `--all` (or `--server local`) plans
+show it as `skip (local desktop; pass --all)`. With `--all` it goes last: the app window is closed
+(SIGTERM), the package switched, the app relaunched in the user's session and verified, rolled back
+on failure. Warn the user that the window closes and reopens; terminals live in the PTY daemon
+and usually survive. If you run inside that Orca window, your process survives too (it is in the
+daemon), but the UI disappears for a while. If no local entry exists, `orca-fleet discover`
+prints how to install the helper; that needs `sudo`, so ask the user to run it (`! sudo ...`).
 
 ## Approval rule (mandatory)
 

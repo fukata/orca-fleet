@@ -28,8 +28,8 @@ RELEASES = [
 
 
 class FakeServer:
-    def __init__(self, name, version="1.4.229", busy=0):
-        self.name, self.version, self.busy = name, version, busy
+    def __init__(self, name, version="1.4.229", busy=0, local=False):
+        self.name, self.version, self.busy, self.local = name, version, busy, local
         self.state = {}
         self.prepared = set()
         self.apply_result = "succeeded"   # what the worker ends with
@@ -43,8 +43,9 @@ class FakeServer:
 
 class FakeEnv(fleet.Env):
     def __init__(self, servers, cfg_extra=None):
-        super().__init__({"servers": [{"name": s.name, "environment": s.name, "ssh": s.name, **(cfg_extra or {}).get(s.name, {})}
-                                      for s in servers]})
+        super().__init__({"servers": [({"name": s.name, "local": True} if s.local else
+                                       {"name": s.name, "environment": s.name, "ssh": s.name})
+                                      | (cfg_extra or {}).get(s.name, {}) for s in servers]})
         self.servers = {s.name: s for s in servers}
         self.calls = []
         self.lock = threading.Lock()
@@ -66,7 +67,13 @@ class FakeEnv(fleet.Env):
     def orca(self, args, timeout=45):
         self.orca_calls.append(args)
         if args[0] == "status":
-            s = self.servers[args[args.index("--environment") + 1]]
+            if "--environment" in args:
+                s = self.servers[args[args.index("--environment") + 1]]
+            else:
+                s = next((x for x in self.servers.values() if x.local), None)
+                if s is None:
+                    return {"ok": True, "result": {"runtime": {"reachable": True, "state": "ready",
+                                                               "appVersion": "1.4.229"}}}
             if s.ssh_down:
                 return {"ok": False, "error": {"message": "remote_runtime_unavailable"}}
             v = s.client_sees or s.version
@@ -84,11 +91,15 @@ class FakeEnv(fleet.Env):
             return {"ok": True, "result": {}}
         if args[:2] == ["host", "list"]:
             return {"ok": True, "result": {"hosts": [{"kind": "local", "name": "this machine"}] +
-                                           [{"kind": "environment", "name": n} for n in self.servers]}}
+                                           [{"kind": "environment", "name": n} for n, x in self.servers.items()
+                                            if not x.local]}}
         raise AssertionError(args)
 
     def ssh_helper(self, server, args, sudo, timeout=900):
-        s = self.servers[server["name"]]
+        s = self.servers.get(server["name"])
+        if s is None:
+            return {"ok": False, "error": {"code": "helper_missing", "message": "No such file"}}
+        assert bool(server.get("local")) == s.local
         with self.lock:
             self.calls.append((s.name, args[0], sudo))
         if s.ssh_down:
@@ -101,7 +112,8 @@ class FakeEnv(fleet.Env):
                 s.unreachable_polls -= 1
                 return {"ok": False, "error": {"code": "ssh_failed", "message": "connection reset"}}
             return {"ok": True, "installed_version": s.version,
-                    "service": {"ActiveState": "active", "SubState": "running"},
+                    "service": {"ActiveState": "active", "SubState": "running",
+                                **({"kind": "desktop"} if s.local else {})},
                     "activity": {"known": True, "agents": s.busy, "busy": [{}] * s.busy},
                     "state": s.state, "worker_active": False}
         if cmd == "prepare":
@@ -558,3 +570,73 @@ class SelfUpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalDesktopTests(unittest.TestCase):
+    def env(self):
+        return FakeEnv([FakeServer("local", local=True), FakeServer("a"), FakeServer("b")],
+                       cfg_extra={"a": {"control": True}})
+
+    def test_local_desktop_is_skipped_without_all(self):
+        env = self.env()
+        rc, out = run(env, ["update", "--yes"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([n for n, c, _ in env.calls if c == "apply"], ["b", "a"])
+        self.assertIn("skip (local desktop; pass --all)", out)
+        self.assertEqual(env.servers["local"].version, "1.4.229")
+        self.assertNotIn("The local desktop app is updated last", out)
+
+    def test_naming_the_local_server_includes_it(self):
+        env = self.env()
+        rc, out = run(env, ["update", "--yes", "--server", "local"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([n for n, c, _ in env.calls if c == "apply"], ["local"])
+
+    def test_local_desktop_is_updated_last_through_local_helper(self):
+        env = self.env()
+        rc, out = run(env, ["update", "--yes", "--all"])
+        self.assertEqual(rc, 0, out)
+        applies = [n for n, c, _ in env.calls if c == "apply"]
+        self.assertEqual(applies, ["b", "a", "local"])   # after the control host
+        self.assertEqual(env.servers["local"].version, "1.4.239")
+        self.assertIn("The local desktop app is updated last", out)
+        # verified over this machine's own runtime, not a paired environment
+        self.assertIn(["status"], env.orca_calls)
+        self.assertIn("outcome: updated", out)
+
+    def test_status_marks_the_desktop_row(self):
+        rc, out = run(self.env(), ["status"])
+        self.assertEqual(rc, 0)
+        line = next(l for l in out.splitlines() if l.startswith("local "))
+        self.assertIn("app:active/running", line)
+
+    def test_local_entry_needs_no_environment_or_ssh(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            Path(p).write_text(json.dumps({"servers": [{"name": "local", "local": True}]}))
+            self.assertEqual(fleet.load_config(p)["servers"][0]["name"], "local")
+
+    def test_local_helper_runs_without_ssh(self):
+        env = fleet.Env({})
+        cp = mock.Mock(stdout='{"ok": true}\n', stderr="", returncode=0)
+        with mock.patch.object(fleet.subprocess, "run", return_value=cp) as run_:
+            self.assertTrue(env.ssh_helper({"name": "local", "local": True}, ["status"], sudo=True)["ok"])
+        self.assertEqual(run_.call_args[0][0], ["sudo", "-n", fleet.HELPER, "--json", "status"])
+
+    def test_missing_local_helper_is_reported_not_raised(self):
+        with mock.patch.object(fleet.subprocess, "run", side_effect=FileNotFoundError(fleet.HELPER)):
+            r = fleet.Env({}).ssh_helper({"name": "local", "local": True}, ["status"], sudo=False)
+        self.assertEqual(r["error"]["code"], "helper_missing")
+
+    def test_discover_adds_local_desktop_when_helper_is_installed(self):
+        env = FakeEnv([FakeServer("local", local=True), FakeServer("a")])
+        env.cfg = {"servers": []}
+        rc, out = run(env, ["discover"])
+        self.assertEqual(rc, 0)
+        line = next(l for l in out.splitlines() if l.startswith("local "))
+        self.assertIn("(local)", line)
+        self.assertRegex(line, r"\byes\b.*\(local\)")   # enabled
+
+    def test_discover_hints_when_no_local_helper(self):
+        rc, out = run(FakeEnv([FakeServer("a")]), ["discover"])
+        self.assertIn("install.sh --desktop", out)

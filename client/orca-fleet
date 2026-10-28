@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """orca-fleet: check and update every remote `orca serve` to one Orca version.
 
+A `"local": true` server entry is this machine's .deb desktop app: the same helper,
+installed here in desktop mode (`install.sh --desktop`), is run through local sudo.
+Updating it closes and reopens the app, so it is only included with `--all` (or
+`--server <its name>`).
+
 Discovery uses Orca itself (`orca-ide host list --json`, `orca-ide status
 --environment <name> --json`). Server-side work goes through SSH to the
 `orca-serve-update` helper, which hands the package switch to a transient
@@ -87,22 +92,28 @@ class Env:
             return {"ok": False, "error": {"code": "bad_output", "message": (cp.stderr or cp.stdout)[:300]}}
 
     def ssh_helper(self, server: dict, args: list[str], sudo: bool, timeout: float = 900) -> dict:
-        host = server["ssh"]
-        if not NAME_RE.match(host) or host.startswith("-"):
-            return {"ok": False, "error": {"code": "bad_host", "message": f"invalid ssh host {host!r}"}}
-        remote = " ".join(shlex.quote(x) for x in (["sudo", "-n"] if sudo else []) + [HELPER, "--json", *args])
-        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=4", "-o", "ClearAllForwardings=yes", host, "--", remote]
+        helper = (["sudo", "-n"] if sudo else []) + [HELPER, "--json", *args]
+        if server.get("local"):
+            argv = helper
+        else:
+            host = server["ssh"]
+            if not NAME_RE.match(host) or host.startswith("-"):
+                return {"ok": False, "error": {"code": "bad_host", "message": f"invalid ssh host {host!r}"}}
+            argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+                    "-o", "ServerAliveCountMax=4", "-o", "ClearAllForwardings=yes", host, "--",
+                    " ".join(shlex.quote(x) for x in helper)]
         try:
             cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": {"code": "ssh_timeout", "message": "ssh timed out"}}
+        except FileNotFoundError as e:  # local helper (or ssh/sudo) not installed
+            return {"ok": False, "error": {"code": "helper_missing", "message": str(e)}}
         line = next((l for l in reversed(cp.stdout.strip().splitlines()) if l.startswith("{")), "")
         try:
             return json.loads(line)
         except json.JSONDecodeError:
             msg = (cp.stderr or cp.stdout).strip()[-400:]
-            code = "ssh_failed" if cp.returncode == 255 else "helper_failed"
+            code = "ssh_failed" if cp.returncode == 255 and not server.get("local") else "helper_failed"
             if "a password is required" in msg or "not allowed" in msg:
                 code = "sudo_denied"
             if "No such file" in msg or "not found" in msg:
@@ -141,7 +152,7 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     if nc is not None and not (isinstance(nc, list) and nc and all(isinstance(x, str) and x for x in nc)):
         raise SystemExit("config: notify_command must be a non-empty argv list of strings")
     for s in cfg.get("servers", []):
-        for k in ("name", "environment", "ssh"):
+        for k in ("name",) if s.get("local") else ("name", "environment", "ssh"):
             if not NAME_RE.match(str(s.get(k, ""))):
                 raise SystemExit(f"config: invalid {k} {s.get(k)!r}")
     return cfg
@@ -164,8 +175,10 @@ def select_servers(cfg: dict, names: list[str] | None) -> list[dict]:
         if bad:
             raise SystemExit(f"unknown server(s): {', '.join(bad)}")
         servers = [s for s in cfg["servers"] if s["name"] in names]
-    # control host (where the coordinator runs) goes last so it is updated after the rest
-    return sorted(servers, key=lambda s: (bool(s.get("control")), s.get("order", 100), s["name"]))
+    # control host (where the coordinator runs) goes last so it is updated after the rest; the local
+    # desktop app goes after that, so a client running inside it keeps its window until the very end
+    return sorted(servers, key=lambda s: (bool(s.get("local")), bool(s.get("control")), s.get("order", 100),
+                                          s["name"]))
 
 
 # --- release resolution -----------------------------------------------------
@@ -286,9 +299,14 @@ def print_changes(changes: list[dict], detail: str = "full") -> None:
 
 
 # --- per-server probes ------------------------------------------------------
+def target_args(server: dict) -> list[str]:
+    """Orca CLI selector: the paired environment, or nothing for this machine's own runtime."""
+    return [] if server.get("local") else ["--environment", server["environment"]]
+
+
 def probe(env: Env, server: dict) -> dict:
     """Independent views: Orca connection (client side) + helper status (SSH)."""
-    st = env.orca(["status", "--environment", server["environment"]])
+    st = env.orca(["status", *target_args(server)])
     orca_view = {"reachable": False}
     if st.get("ok"):
         rt = st.get("result", {}).get("runtime", {})
@@ -319,7 +337,8 @@ def summarize(p: dict, target: str | None = None) -> dict:
         "ssh": bool(h),
         "orca_version": p["orca"].get("version"),
         "installed_version": installed,
-        "service": f"{svc.get('ActiveState', '?')}/{svc.get('SubState', '?')}" if svc else "?",
+        "service": (("app:" if svc.get("kind") == "desktop" else "")
+                    + f"{svc.get('ActiveState', '?')}/{svc.get('SubState', '?')}") if svc else "?",
         "agents": act.get("agents") if act.get("known") else None,
         "busy_agents": len(act.get("busy", [])) if act.get("known") else None,
         "update_state": (f"{state.get('op')}:{state.get('result') or state.get('phase')}" if state.get("op_id") else "-"),
@@ -435,7 +454,7 @@ def cmd_discover(env: Env, args) -> int:
     hl = env.orca(["host", "list"])
     if not hl.get("ok"):
         raise SystemExit(f"orca host list failed: {hl.get('error')}")
-    known = {s["environment"]: s for s in cfg.get("servers", [])}
+    known = {s["environment"]: s for s in cfg.get("servers", []) if not s.get("local")}
     found = []
     for h in hl["result"]["hosts"]:
         if h.get("kind") != "environment" or not NAME_RE.match(h.get("name", "")):
@@ -448,15 +467,27 @@ def cmd_discover(env: Env, args) -> int:
         entry.setdefault("enabled", headless)
         found.append({**entry, "_reachable": bool(rt.get("reachable")), "_version": rt.get("appVersion"),
                       "_install_mode": mode, "_headless_serve": headless})
+    local = next((s for s in cfg.get("servers", []) if s.get("local")), None)
+    lh = env.ssh_helper({"name": "local", "local": True}, ["status"], sudo=False, timeout=60)
+    if local or (lh.get("ok") and (lh.get("service") or {}).get("kind") == "desktop"):
+        st = env.orca(["status"])
+        rt = st.get("result", {}).get("runtime", {}) if st.get("ok") else {}
+        entry = local or {"name": "local", "local": True}
+        entry.setdefault("enabled", bool(lh.get("ok")))
+        found.append({**entry, "_reachable": bool(rt.get("reachable")), "_version": rt.get("appVersion"),
+                      "_install_mode": "desktop", "_headless_serve": False})
     rows = [{"server": f["name"], "reachable": f["_reachable"], "version": f["_version"],
              "headless_serve": f["_headless_serve"] if f["_reachable"] else None,
-             "enabled": f["enabled"], "ssh": f["ssh"]} for f in found]
+             "enabled": f["enabled"], "ssh": "(local)" if f.get("local") else f["ssh"]} for f in found]
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
         print_table(rows, ["server", "reachable", "version", "headless_serve", "enabled", "ssh"])
         print("\n(unreachable or desktop environments are listed but disabled; edit "
               f"{CONFIG_PATH} to change ssh host / enabled / control)")
+        if not any(f.get("local") for f in found):
+            print("(this machine's desktop app is not listed: install the helper with "
+                  "`sudo server/install.sh --desktop` to manage it)")
     if args.write:
         cfg["servers"] = [{k: v for k, v in f.items() if not k.startswith("_")} for f in found]
         save_config(cfg)
@@ -503,6 +534,8 @@ def build_plan(env: Env, args) -> tuple[dict, list[dict]]:
             action = "recover-first"
         elif not row.get("needs_update", True):
             action = "skip (already at target)"
+        elif s.get("local") and not (getattr(args, "all", False) or s["name"] in (args.server or [])):
+            action = "skip (local desktop; pass --all)"
         elif row.get("downgrade") and not getattr(args, "allow_downgrade", False):
             action = "skip (would downgrade; pass --allow-downgrade)"
         elif row["busy_agents"] and args.mode == "safe":
@@ -520,6 +553,9 @@ def print_plan(target: dict, plan: list[dict], mode: str) -> None:
     print_table(plan, ["server", "installed_version", "service", "agents", "busy_agents", "action"])
     print("\nOrder: downloads run in parallel; restarts run one server at a time "
           "(control host last); a failure stops the rollout.")
+    if any(p["_server"].get("local") and p["action"].startswith("update") for p in plan):
+        print("The local desktop app is updated last: its window closes and reopens; "
+              "terminals keep running in the PTY daemon.")
 
 
 def ask(prompt: str) -> str:
@@ -586,8 +622,10 @@ def wait_for_op(env: Env, server: dict, op_id: str, timeout: float, poll: float)
 def independent_verify(env: Env, server: dict, version: str, attempts: int = 10) -> dict:
     """Client-side reconnect over Orca: the server must answer with the target version."""
     last = {}
+    if server.get("local"):
+        attempts *= 3  # a relaunched desktop app takes longer than orca serve to come up
     for _ in range(attempts):
-        st = env.orca(["status", "--environment", server["environment"]])
+        st = env.orca(["status", *target_args(server)])
         rt = st.get("result", {}).get("runtime", {}) if st.get("ok") else {}
         last = {"reachable": bool(rt.get("reachable")), "version": rt.get("appVersion"), "state": rt.get("state")}
         if last["reachable"] and last["state"] == "ready" and last["version"] == version:
@@ -972,6 +1010,8 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--version", default="latest", help="latest (stable) or X.Y.Z")
         if mode:
             sp.add_argument("--mode", choices=["safe", "force"], default="safe")
+            sp.add_argument("--all", action="store_true",
+                            help="also update this machine's desktop app (closes and reopens its window)")
         return sp
 
     d = sub.add_parser("discover", help="find paired Orca servers via `orca host list`")

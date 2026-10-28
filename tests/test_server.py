@@ -112,6 +112,10 @@ class FakeSystem(osu.Runner):
         self.calls = []
         self._stable_checks = 0
         self.selftest = (0, '{"ok": true}')   # (rc, stdout) of a new helper's `--json status`
+        self.package_files = ""          # dpkg-query -L output
+        self.app_hangs = False           # desktop app ignores SIGTERM
+        self.signals = []
+        self.app_launches = []
 
     def cp(self, out="", rc=0, err=""):
         return subprocess.CompletedProcess([], rc, out, err)
@@ -130,7 +134,7 @@ class FakeSystem(osu.Runner):
         if cmd == "dpkg-query" and a[1] == "-W":
             return self.cp(f"install ok installed\t{self.installed}") if self.installed else self.cp("", 1)
         if cmd == "dpkg-query" and a[1] == "-L":
-            return self.cp("")
+            return self.cp(self.package_files)
         if cmd == "dpkg-deb":
             data = Path(a[2]).read_bytes()
             if not data.startswith(b"FAKEDEB:"):
@@ -145,6 +149,16 @@ class FakeSystem(osu.Runner):
             return self.cp("ok")
         if cmd == "systemctl":
             return self.systemctl(a[1:])
+        if cmd == "systemd-run" and "--user" in a:
+            # desktop relaunch in the user's manager
+            self.app_launches.append(a)
+            if self.installed in self.fail_start_for:
+                return self.cp("", 1, "Failed to start transient service unit")
+            self.active = True
+            self.main_pid += 10
+            self.runtime_version = self.installed
+            self._stable_checks = 0
+            return self.cp()
         if cmd == "systemd-run":
             if self.worker_active:
                 return self.cp("", 1, "Unit already exists")
@@ -230,6 +244,22 @@ class TestUpdater(osu.Updater):
     def pids_alive(self, pids):
         live = {d["pid"] for d in self._daemons} - self.dead_after_update
         return [p for p in pids if p in live]
+
+
+class DesktopUpdater(TestUpdater):
+    """Desktop mode: the fake system's `active` flag is the app's main process."""
+
+    def desktop_app_pid(self, proc="/proc"):
+        if self.runner.active and self.runner.installed in self.runner.flap_for:
+            self.runner._stable_checks += 1
+            if self.runner._stable_checks > 1:
+                self.runner.main_pid += 1
+        return self.runner.main_pid if self.runner.active else None
+
+    def signal_pid(self, pid, sig):
+        self.runner.signals.append(sig)
+        if sig == osu.signal.SIGKILL or not self.runner.app_hangs:
+            self.runner.active = False
 
 
 class Base(unittest.TestCase):
@@ -767,3 +797,136 @@ class HelperSelfUpdate(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Desktop(Base):
+    def setUp(self):
+        super().setUp()
+        Path(self.paths["config"]).write_text(json.dumps({
+            "kind": "desktop", "service_user": ME, "cli": "/usr/bin/orca-ide", "app": "/opt/Orca/orca-ide",
+            "verify_timeout_seconds": 30, "stability_seconds": 1, "app_stop_timeout_seconds": 5}))
+        self.u = DesktopUpdater(runner=self.sys, http=self.http, paths=self.paths, require_root=False,
+                                sleep=lambda s: None, clock=self.u.clock)
+        self.u.cmd_prepare("1.4.239")
+
+    def service_calls(self):
+        return [c for c in self.sys.calls if c[0] == "systemctl" and c[1] in {"stop", "start"}]
+
+    def test_config_needs_no_service_or_port(self):
+        self.assertEqual(self.u.config()["kind"], "desktop")
+        with self.assertRaises(osu.UpdateError):
+            osu.Updater._validate_config({"kind": "laptop", "service_user": ME})
+
+    def test_status_reports_the_app(self):
+        out = self.u.cmd_status()
+        self.assertEqual(out["service"]["kind"], "desktop")
+        self.assertEqual(out["service"]["ActiveState"], "active")
+        self.assertNotIn("listening", out["service"])
+
+    def test_update_quits_installs_and_relaunches_the_app(self):
+        self.assertEqual(self.run_worker(), 0)
+        st = self.state()
+        self.assertEqual(st["result"], "succeeded")
+        self.assertTrue(st["app_was_running"])
+        self.assertEqual(self.sys.installed, "1.4.239")
+        self.assertEqual(self.sys.signals, [osu.signal.SIGTERM])
+        self.assertEqual(len(self.sys.app_launches), 1)
+        launch = self.sys.app_launches[0]
+        self.assertEqual(launch[:3], ["runuser", "-u", ME] if os.geteuid() == 0 else ["systemd-run", "--user", "--collect"])
+        self.assertEqual(launch[-1], "/opt/Orca/orca-ide")
+        self.assertEqual(self.service_calls(), [])  # no systemd service is touched
+        phases = [h["phase"] for h in st["history"]]
+        self.assertLess(phases.index("stopping_app"), phases.index("installing"))
+        self.assertLess(phases.index("installing"), phases.index("starting_app"))
+
+    def test_closed_app_stays_closed(self):
+        self.sys.active = False
+        self.u.preflight = lambda v, m, in_worker=False: {"blockers": [], "warnings": []}
+        self.assertEqual(self.run_worker(), 0)
+        st = self.state()
+        self.assertEqual((st["result"], st["app_was_running"]), ("succeeded", False))
+        self.assertEqual(self.sys.app_launches, [])
+        self.assertEqual(st["verify"], {"installed_version": "1.4.239", "app_running": False})
+
+    def test_wrong_runtime_version_rolls_back_and_relaunches_old(self):
+        self.sys.bad_runtime_for.add("1.4.239")
+        self.assertEqual(self.run_worker(), 0)
+        self.assertEqual(self.state()["result"], "rolled_back")
+        self.assertEqual(self.sys.installed, "1.4.229")
+        self.assertTrue(self.sys.active)
+        self.assertEqual(len(self.sys.app_launches), 2)
+
+    def test_failed_relaunch_rolls_back(self):
+        self.sys.fail_start_for.add("1.4.239")
+        self.run_worker()
+        self.assertEqual(self.state()["result"], "rolled_back")
+        self.assertTrue(self.sys.active)
+
+    def test_crashing_app_rolls_back(self):
+        self.sys.flap_for.add("1.4.239")
+        self.run_worker()
+        self.assertEqual(self.state()["result"], "rolled_back")
+
+    def test_hung_app_is_killed(self):
+        self.sys.app_hangs = True
+        self.assertEqual(self.run_worker(), 0)
+        st = self.state()
+        self.assertEqual(st["result"], "succeeded")
+        self.assertEqual(self.sys.signals, [osu.signal.SIGTERM, osu.signal.SIGKILL])
+        self.assertIn("app_killed", st)
+
+    def test_dpkg_failure_relaunches_old_app(self):
+        self.sys.fail_dpkg_for.add("1.4.239")
+        self.run_worker()
+        self.assertEqual(self.state()["result"], "rolled_back")
+        self.assertEqual(self.sys.installed, "1.4.229")
+        self.assertTrue(self.sys.active)
+
+    def test_lingering_is_not_required(self):
+        self.sys.linger = "no"
+        r = self.u.cmd_apply("1.4.239", "safe", dry_run=True)
+        self.assertEqual(r["result"], "dry_run_ok")
+
+    def test_safe_defers_on_working_agent(self):
+        self.sys.agents = [{"agentType": "claude", "state": "working"}]
+        self.assertEqual(self.u.cmd_apply("1.4.239", "safe")["result"], "deferred")
+
+    def test_recover_relaunches_app_after_crash_mid_install(self):
+        self.sys.active = False   # worker died after quitting the app
+        Path(self.paths["state"]).write_text(json.dumps({
+            "op_id": "111111111111", "op": "update", "phase": "installing", "result": None,
+            "target": "1.4.239", "previous": "1.4.229", "app_was_running": True}))
+        self.assertEqual(self.run_worker(op_id="222222222222", kind="recover", version=None, mode=None), 0)
+        self.assertEqual(self.state()["result"], "rolled_back")
+        self.assertTrue(self.sys.active)
+
+    def test_init_discovers_the_deb_desktop_install(self):
+        self.sys.package_files = "/opt/Orca\n/opt/Orca/orca-ide\n/usr/share/applications/orca-ide.desktop\n"
+        with mock.patch.dict(os.environ, {"SUDO_USER": ME}):
+            out = self.u.cmd_init(None, write=True, desktop=True)
+        self.assertEqual(out["config"]["kind"], "desktop")
+        self.assertEqual(out["config"]["service_user"], ME)
+        self.assertEqual(out["config"]["app"], "/opt/Orca/orca-ide")
+
+    def test_init_refuses_non_deb_or_unknown_user(self):
+        with mock.patch.dict(os.environ, {"SUDO_USER": ME}):
+            with self.assertRaises(osu.UpdateError):
+                self.u.cmd_init(None, write=False, desktop=True)   # AppImage etc.: no /opt/Orca/orca-ide
+        self.sys.package_files = "/opt/Orca/orca-ide\n"
+        with mock.patch.dict(os.environ, {"SUDO_USER": "root"}):
+            with self.assertRaises(osu.UpdateError):
+                self.u.cmd_init(None, write=False, desktop=True)
+
+    def test_desktop_app_pid_picks_the_main_process(self):
+        proc = Path(self.tmp) / "proc"
+        app = Path(self.tmp) / "Orca" / "orca-ide"
+        app.parent.mkdir()
+        app.write_text("")
+        for pid, argv in {"10": [str(app), "--type=renderer"], "11": [str(app)],
+                          "12": [str(app), "/x/daemon-entry.js", "--socket", "s"], "13": ["/usr/bin/bash"]}.items():
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+        cfg = dict(self.u.config(), app=str(app))
+        u = osu.Updater(paths=self.paths, require_root=False)
+        u._cfg = cfg
+        self.assertEqual(u.desktop_app_pid(proc=str(proc)), 11)
