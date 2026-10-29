@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -141,7 +142,8 @@ class FakeWindows(odu.System):
                 return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "result": {"runtime": rt}}), "")
             if argv[1:3] == ["worktree", "ps"]:
                 wt = {"displayName": "main", "liveTerminalCount": len(self.terminals),
-                      "agents": [{"agentType": "claude", "state": s} for s in self.agents]}
+                      "agents": [{"agentType": "claude", "state": s, "paneKey": f"pane{i}"}
+                                 for i, s in enumerate(self.agents)]}
                 return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "result": {"worktrees": [wt]}}), "")
         if argv[0].startswith(self.paths["cache_dir"]):
             self.calls.append(("install", argv))
@@ -258,6 +260,16 @@ class Apply(Base):
         self.win.agents = ["working"]
         self.assertEqual(self.u.cmd_apply("1.4.244", "safe")["result"], "deferred")
         self.assertEqual(self.u.cmd_apply("1.4.244", "force")["result"], "started")
+
+    def test_the_calling_agent_does_not_defer_its_own_update(self):
+        self.prepare()
+        self.win.agents = ["working"]
+        with unittest.mock.patch.dict(os.environ, {"ORCA_PANE_KEY": "pane0"}):
+            r = self.u.cmd_apply("1.4.244", "safe")
+            self.assertEqual(r["result"], "started")
+            self.assertEqual(len(r["activity"]["caller"]), 1)
+            self.win.agents = ["working", "working"]   # another agent still defers
+            self.assertEqual(self.u.cmd_apply("1.4.244", "safe")["result"], "deferred")
 
     def test_same_version_skipped_and_downgrade_refused(self):
         self.assertEqual(self.u.cmd_apply("1.4.240", "safe")["result"], "skipped")

@@ -595,7 +595,10 @@ class Updater:
             return {"known": False, "reason": "worktree ps unavailable", "busy": [], "monitoring": [],
                     "blocked": [], "agents": 0, "live_terminals": None}
         res = d.get("result") or {}
-        busy, monitoring, blocked = [], [], []
+        busy, monitoring, blocked, caller = [], [], [], []
+        # the agent whose terminal runs this update (e.g. a daily automation) is waiting on it, and its
+        # terminal lives in the PTY daemon, so it must not defer its own update forever
+        own_pane = os.environ.get("ORCA_PANE_KEY") or None
         agents = live = unverifiable = 0
         for w in res.get("worktrees", []) if isinstance(res, dict) else []:
             if not isinstance(w, dict):
@@ -609,13 +612,15 @@ class Updater:
                 item = {"agent": a.get("agentType"), "worktree": w.get("displayName") or w.get("branch"),
                         "state": a.get("state"), "since": a.get("stateStartedAt"),
                         "title": (a.get("taskTitle") or a.get("displayName") or a.get("prompt") or "")[:80]}
-                if a.get("state") == "working":
+                if own_pane and a.get("paneKey") == own_pane:
+                    caller.append(item)
+                elif a.get("state") == "working":
                     (monitoring if a.get("workingMode") == "monitoring" else busy).append(item)
                 elif a.get("state") == "blocked":
                     blocked.append(item)
         return {"known": True, "agents": agents, "live_terminals": live,
                 "unverifiable_terminals": unverifiable, "busy": busy, "monitoring": monitoring,
-                "blocked": blocked, "truncated": bool(res.get("truncated"))}
+                "blocked": blocked, "caller": caller, "truncated": bool(res.get("truncated"))}
 
     def daemon_processes(self) -> list[dict]:
         """PTY daemons: Orca.exe copies under daemon-host-profiles\\<profile>\\<version>\\<build>\\.
@@ -924,6 +929,8 @@ class Updater:
                 report["warnings"].append(f"{len(act['monitoring'])} agent(s) in monitoring loops (not blocking)")
             if act["blocked"]:
                 report["warnings"].append(f"{len(act['blocked'])} agent(s) waiting for permission (not blocking)")
+            if act.get("caller"):
+                report["warnings"].append("the agent running this update is not counted (its terminal survives)")
         if daemons or act.get("live_terminals"):
             meta = read_json(self.meta_path(version)) or {}
             facts = meta.get("daemon_protocol")
