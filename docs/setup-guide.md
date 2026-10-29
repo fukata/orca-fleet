@@ -54,7 +54,8 @@ ps -eo pid,args | grep 'cli/index.js serve' | grep -v grep        # serve の実
 | user unit | AppImage | Step 3 を `--install-deb` 付きで → 4 |
 | system unit | AppImage | 対象外。手作業で .deb に入れ替えてから Step 4 |
 | 手動起動や tmux など、systemd の外 | — | 対象外。先に system unit を作る |
-| macOS / Windows のデスクトップ版 | — | 対象外 |
+| Windows のデスクトップ版（クライアントのマシン） | ユーザー単位の NSIS | サーバー作業は不要。README の「Windows のデスクトップ版」を参照 |
+| macOS のデスクトップ版 | — | 対象外 |
 
 orca-serve-update が扱えるのは「system unit（`User=` 指定）＋ `ExecStart` が `orca-ide serve` を直接起動している＋ .deb 版」の構成だけです。
 

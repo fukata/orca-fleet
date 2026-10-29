@@ -12,6 +12,7 @@
   - 更新処理は transient systemd unit に引き渡して実行します。
   - 状態の永続化、監査ログ、ロールバック、中断からの復旧を担います。
   - `--desktop` で導入すると、サーバーではなくこのマシンの .deb 版デスクトップアプリを更新対象にします（[デスクトップ版](#このマシンのデスクトップ版)）。
+- **`client/orca-desktop-update`**: Windows のデスクトップ版を更新するヘルパーです。クライアントと一緒に配置され、管理者権限なしで動きます。`orca-serve-update` と同じ JSON プロトコルで応答します（[Windows のデスクトップ版](#windows-のデスクトップ版)）。
 - **`skill/orca-fleet`**: Orca 上の Claude から自然言語で操作するためのスキルです。
 
 ---
@@ -168,6 +169,7 @@ RPM や AppImage でインストールしている環境は対象外です。
 ```
 client/orca-fleet            クライアントCLI (python3 標準ライブラリのみ)
 client/orca-fleet.cmd        Windows (PowerShell / cmd) 用ランチャー
+client/orca-desktop-update   Windows のデスクトップ版の更新ヘルパー (python3 標準ライブラリのみ)
 client/install.sh            ~/.local/bin と ~/.claude/skills へ配置
 server/orca-serve-update     サーバーヘルパー (python3 標準ライブラリのみ)
 server/install.sh            サーバーへの導入 (helper / sudoers / config)
@@ -176,7 +178,8 @@ server/systemd/…/recommended.conf  任意: RestartPreventExitStatus=3 78
 skill/orca-fleet/SKILL.md   自然言語操作用スキル
 docs/setup-guide.md          別環境への導入ガイド (現状調査 → 移行 → 導入 → automations)
 tests/test_server.py         サーバー側ユニットテスト (59)
-tests/test_client.py         クライアント側ユニットテスト (35)
+tests/test_client.py         クライアント側ユニットテスト
+tests/test_desktop_win.py    Windows デスクトップ版ヘルパーのユニットテスト (Windows を模擬するので OS を問わず実行可)
 tests/e2e/                   systemd コンテナでの実 .deb E2E
 ```
 
@@ -226,6 +229,28 @@ orca-fleet update --all                    # リモートのサーバーを更�
 - `update` / `retry` / `plan` は、`--all` か `--server local` を指定したときだけ local を対象にします。それ以外では `skip (local desktop; pass --all)` と表示します。local の更新は、ほかのすべてのサーバー（control も含む）より後に行います。
 - sudo-rs（Ubuntu 26.04 以降の既定）は、引数の途中にあるワイルドカードを受け付けません。そのため、sudo-rs のときは `_worker` / `init` の拒否ルールを省きます。許可しているコマンドはどれも `--json` の直後のサブコマンドが固定されているので、拒否ルールがなくても `_worker` や `init` は実行できません。
 
+### Windows のデスクトップ版
+
+Windows クライアントでは、そのマシンの Orca デスクトップ版（ユーザー単位の NSIS インストール、`%LOCALAPPDATA%\Programs\orca`）も更新できます。ヘルパー `orca-desktop-update` は `client/install.sh` が `orca-fleet` の隣に配置するので、別途の導入作業も sudo も要りません。
+
+```bash
+orca-fleet discover --write    # Orca が入っていれば "local" エントリが追加される
+orca-fleet plan --all
+orca-fleet update --all        # リモートを更新したあと、最後にデスクトップ版を更新
+```
+
+- 更新の流れは次のとおりです。処理は切り離したワーカープロセスで進むので、呼び出したターミナルやクライアントが終了しても止まりません。
+  1. SAFE の事前確認（エージェントの作業状況、PTY デーモンのプロトコル互換）。デーモンのプロトコルは、デーモンの配置パス（`%LOCALAPPDATA%\Orca\daemon-host-profiles\<profile>\<版>\…`）にある版のソースから読みます。
+  2. アプリのウィンドウを閉じます（WM_CLOSE）。`app_stop_timeout_seconds`（30 秒）を過ぎたら強制終了し、インストール先に残った Orca のプロセスも終了します。PTY デーモンはインストール先の外にあるコピーから動いているため、触りません。
+  3. 公式インストーラー `orca-windows-setup.exe` を `/S /currentuser` で実行します。
+  4. 更新前にアプリが起動していた場合は、Explorer 経由で起動し直します（ジョブの外で、シェルの環境変数のまま起動するためです）。
+  5. CLI でランタイムのバージョンを確認し、安定期間のあいだメインプロセスが変わらないことも確認します。失敗した場合は旧版のインストーラーで戻します。
+- インストーラーは、GitHub が公開している sha256、Authenticode 署名（`CN=SignPath Foundation`）、製品バージョンの3点を確認してから使います。
+- 通信には Windows の `curl.exe`（Schannel）を使います。GitHub のダウンロード用サーバーの証明書チェーンは、Windows が必要になったときに取得するルート証明書（Sectigo E46 など）で終わる場合があり、Python（OpenSSL）では検証に失敗するためです。インストーラーの完全性は上記の sha256 と署名で確認するので、通信手段には依存しません。
+- 状態、キャッシュ、監査ログは `~/.local/state/orca-desktop-update` に置きます。Microsoft Store 版の Python は、自分で `AppData` に作ったファイルを専用フォルダーへリダイレクトするため、`AppData` は使いません。
+- 対応しているのは x64 だけです（Windows 用のインストーラーは x64 版しかありません）。
+- ヘルパーはクライアントのファイルなので、`orca-fleet self-update` で一緒に更新されます。サーバー側の helper の自己更新の対象にはなりません。
+
 ### クライアント
 
 ```bash
@@ -236,7 +261,7 @@ orca-fleet discover --write    # ~/.config/orca-fleet/config.json
 
 #### Windows クライアント
 
-- Git Bash で `client/install.sh` を実行します。`~/.local/bin` に `orca-fleet` と `orca-fleet.cmd` が入るので、PowerShell や cmd からも `orca-fleet` で呼べます（`~/.local/bin` を PATH に入れておきます）。
+- Git Bash で `client/install.sh` を実行します。`~/.local/bin` に `orca-fleet`、`orca-fleet.cmd`、`orca-desktop-update` が入るので、PowerShell や cmd からも `orca-fleet` で呼べます（`~/.local/bin` を PATH に入れておきます）。
 - 前提は python 3.10 以上と OpenSSH クライアント（Windows 標準）です。
 - Windows と macOS の Orca CLI は `orca` です。`orca-ide` が見つからない場合は `orca` を使います。明示したい場合は設定ファイルで `"orca_cli": "orca"` を指定します。
 - リポジトリは `.gitattributes` で LF に固定しています。サーバーへ `scp` するスクリプトが CRLF になると動かないためです。それ以前に clone した作業ツリーは `git add --renormalize .` のあと、`git checkout -- .` でチェックアウトし直してください。
@@ -280,7 +305,7 @@ orca-fleet --self-update plan --needs-action    # 先に自己更新し、新し
 ```
 
 - 取り込み元の clone は `--repo`、設定ファイルの `source_repo`、カレントディレクトリの順に探します。automation の workspace をこのリポジトリにしておけば、設定は不要です。
-- 配置するのは `orca-fleet`、`SKILL.md`、Windows では `orca-fleet.cmd` です。中身が同じファイルは書き換えません。
+- 配置するのは `orca-fleet`、`SKILL.md`、Windows では `orca-fleet.cmd` と `orca-desktop-update` です。中身が同じファイルは書き換えません。
 - 次の場合は警告だけ出して、今のバージョンのまま続行します。更新が止まることはありません。
   - clone にコミットしていない変更がある（取り込みも配置もしません）
   - fast-forward できない、またはオフライン
@@ -349,7 +374,7 @@ automation の precheck（`plan --needs-action`）で全台 skip だった日は
 ## 9. テスト
 
 ```bash
-python3 -m unittest discover -s tests -v       # 94 tests
+python3 -m unittest discover -s tests -v
 ```
 
 ### ユニットテストで扱うケース
@@ -400,6 +425,7 @@ E2E の途中で、ユニットテストでは見つからなかったバグを2
 - `dpkg` 実行中にプロセスを強制終了された場合（パッケージが中途半端な状態になったとき。`recover` で `dpkg -i` を再実行して修復する設計です）
 - arm64 環境
 - デスクトップ版の実機での更新（SIGTERM で終了したあとも、ターミナルとエージェントが PTY デーモン上で生き続けること）。終了後に PTY scope が消えた場合は、`pty_sessions_lost` として記録されます。
+- Windows のデスクトップ版の実機での切り替え（WM_CLOSE で終了するか、サイレントインストール後に PTY デーモン上のターミナルが生き続けるか）。実機で確認したのは `status`、`check`、`prepare`（実リリースのダウンロード、sha256・署名・製品バージョンの検証）、`apply --dry-run`、ロックと切り離したワーカーの起動までです。ターミナルが失われた場合は `pty_sessions_lost` として記録されます。
 
 ## 10. 運用・復旧手順
 

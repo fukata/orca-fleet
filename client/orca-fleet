@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """orca-fleet: check and update every remote `orca serve` to one Orca version.
 
-A `"local": true` server entry is this machine's .deb desktop app: the same helper,
-installed here in desktop mode (`install.sh --desktop`), is run through local sudo.
-Updating it closes and reopens the app, so it is only included with `--all` (or
-`--server <its name>`).
+A `"local": true` server entry is this machine's desktop app. On Linux (.deb) the same
+helper, installed here in desktop mode (`install.sh --desktop`), is run through local
+sudo; on Windows the per-user `orca-desktop-update` installed next to this script is
+run directly. Updating it closes and reopens the app, so it is only included with
+`--all` (or `--server <its name>`).
 
 Discovery uses Orca itself (`orca-ide host list --json`, `orca-ide status
 --environment <name> --json`). Server-side work goes through SSH to the
@@ -37,6 +38,8 @@ STABLE_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)\Z")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,100}\Z")
 GITHUB_RELEASES = "https://api.github.com/repos/stablyai/orca/releases?per_page=40"
 HELPER = "/usr/local/sbin/orca-serve-update"
+# Windows: the desktop helper ships with the client (no root, no SSH)
+WINDOWS_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orca-desktop-update")
 CONFIG_PATH = os.environ.get("ORCA_FLEET_CONFIG") or os.path.expanduser("~/.config/orca-fleet/config.json")
 TERMINAL = {"succeeded", "skipped", "deferred", "rolled_back", "failed", "rollback_failed"}
 
@@ -93,7 +96,9 @@ class Env:
 
     def ssh_helper(self, server: dict, args: list[str], sudo: bool, timeout: float = 900) -> dict:
         helper = (["sudo", "-n"] if sudo else []) + [HELPER, "--json", *args]
-        if server.get("local"):
+        if server.get("local") and sys.platform == "win32":
+            argv = [sys.executable, "-I", WINDOWS_HELPER, "--json", *args]
+        elif server.get("local"):
             argv = helper
         else:
             host = server["ssh"]
@@ -121,8 +126,18 @@ class Env:
             return {"ok": False, "error": {"code": code, "message": msg or f"exit {cp.returncode}"}}
 
     def releases(self) -> list:
-        req = urllib.request.Request(GITHUB_RELEASES, headers={"Accept": "application/vnd.github+json",
-                                                               "User-Agent": "orca-fleet"})
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "orca-fleet"}
+        curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+        if sys.platform == "win32" and os.path.isfile(curl):
+            # Windows Python (OpenSSL) cannot fetch missing roots and intermittently rejects GitHub's
+            # chain (CERTIFICATE_VERIFY_FAILED); Windows' own curl (Schannel) validates it
+            cp = subprocess.run([curl, "--silent", "--show-error", "--fail", "--proto", "=https",
+                                 "--max-time", "60", *(a for k, v in headers.items() for a in ("-H", f"{k}: {v}")),
+                                 GITHUB_RELEASES], capture_output=True, timeout=90)
+            if cp.returncode != 0:
+                raise urllib.error.URLError(cp.stderr.decode("utf-8", "replace").strip() or f"curl exit {cp.returncode}")
+            return json.loads(cp.stdout)
+        req = urllib.request.Request(GITHUB_RELEASES, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read())
 
@@ -486,8 +501,12 @@ def cmd_discover(env: Env, args) -> int:
         print("\n(unreachable or desktop environments are listed but disabled; edit "
               f"{CONFIG_PATH} to change ssh host / enabled / control)")
         if not any(f.get("local") for f in found):
-            print("(this machine's desktop app is not listed: install the helper with "
-                  "`sudo server/install.sh --desktop` to manage it)")
+            if sys.platform == "win32":
+                print("(this machine's desktop app is not listed: orca-desktop-update found no per-user "
+                      f"Orca install ({(lh.get('error') or {}).get('code') or lh.get('config_error')}))")
+            else:
+                print("(this machine's desktop app is not listed: install the helper with "
+                      "`sudo server/install.sh --desktop` to manage it)")
     if args.write:
         cfg["servers"] = [{k: v for k, v in f.items() if not k.startswith("_")} for f in found]
         save_config(cfg)
@@ -885,6 +904,8 @@ def install_targets(root: str) -> list[tuple[str, str]]:
              (os.path.join(root, "skill", "orca-fleet", "SKILL.md"), os.path.join(SKILL_DIR, "SKILL.md"))]
     if sys.platform == "win32":
         files.append((os.path.join(root, "client", "orca-fleet.cmd"), os.path.join(INSTALL_DIR, "orca-fleet.cmd")))
+        files.append((os.path.join(root, "client", "orca-desktop-update"),
+                      os.path.join(INSTALL_DIR, "orca-desktop-update")))
     return files
 
 
@@ -929,7 +950,7 @@ def self_update(cfg: dict, repo: str | None = None, pull: bool = True) -> dict:
                         continue
             except FileNotFoundError:
                 pass
-            if src.endswith(os.path.join("client", "orca-fleet")):
+            if src.endswith((os.path.join("client", "orca-fleet"), os.path.join("client", "orca-desktop-update"))):
                 compile(new, src, "exec")  # never install a client that cannot even be parsed
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             tmp = f"{dst}.tmp-{os.getpid()}"
@@ -954,6 +975,9 @@ def print_self_update(res: dict, stream=None) -> None:
 
 def self_update_servers(env: Env, servers: list[dict]) -> dict[str, dict]:
     """Ask each server's helper to replace itself from its own root-configured repo/ref."""
+    # on Windows the local helper is a client file, installed by the client self-update itself
+    servers = [s for s in servers if not (s.get("local") and sys.platform == "win32")]
+
     def one(s):
         return s["name"], env.ssh_helper(s, ["self-update"], sudo=True, timeout=180)
 

@@ -6,7 +6,10 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -D -m 0755 "$here/orca-fleet" "$HOME/.local/bin/orca-fleet"
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) install -D -m 0644 "$here/orca-fleet.cmd" "$HOME/.local/bin/orca-fleet.cmd" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    install -D -m 0644 "$here/orca-fleet.cmd" "$HOME/.local/bin/orca-fleet.cmd"
+    # updater for this machine's Orca desktop app (the "local" entry; no admin rights needed)
+    install -D -m 0755 "$here/orca-desktop-update" "$HOME/.local/bin/orca-desktop-update" ;;
 esac
 if [ "${1:-}" != "--no-skill" ]; then
   install -D -m 0644 "$here/../skill/orca-fleet/SKILL.md" "$HOME/.claude/skills/orca-fleet/SKILL.md"

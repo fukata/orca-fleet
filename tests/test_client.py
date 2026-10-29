@@ -487,6 +487,7 @@ class SelfUpdateTests(unittest.TestCase):
         self.git("clone", "-q", str(origin), str(self.dev))
         self.write(self.dev, "client/orca-fleet", "print('v1')\n")
         self.write(self.dev, "client/orca-fleet.cmd", "@echo off\r\n")
+        self.write(self.dev, "client/orca-desktop-update", "print('desktop v1')\n")
         self.write(self.dev, "skill/orca-fleet/SKILL.md", "# v1\n")
         self.commit(self.dev, "v1")
         self.git("clone", "-q", str(origin), str(self.clone))
@@ -619,9 +620,32 @@ class LocalDesktopTests(unittest.TestCase):
     def test_local_helper_runs_without_ssh(self):
         env = fleet.Env({})
         cp = mock.Mock(stdout='{"ok": true}\n', stderr="", returncode=0)
-        with mock.patch.object(fleet.subprocess, "run", return_value=cp) as run_:
+        with mock.patch.object(fleet.subprocess, "run", return_value=cp) as run_, \
+                mock.patch.object(fleet.sys, "platform", "linux"):
             self.assertTrue(env.ssh_helper({"name": "local", "local": True}, ["status"], sudo=True)["ok"])
         self.assertEqual(run_.call_args[0][0], ["sudo", "-n", fleet.HELPER, "--json", "status"])
+
+    def test_windows_local_helper_runs_next_to_the_client_without_sudo(self):
+        env = fleet.Env({})
+        cp = mock.Mock(stdout='{"ok": true}\n', stderr="", returncode=0)
+        with mock.patch.object(fleet.subprocess, "run", return_value=cp) as run_, \
+                mock.patch.object(fleet.sys, "platform", "win32"):
+            self.assertTrue(env.ssh_helper({"name": "local", "local": True}, ["apply", "--version", "1.4.239"],
+                                           sudo=True)["ok"])
+        self.assertEqual(run_.call_args[0][0], [fleet.sys.executable, "-I", fleet.WINDOWS_HELPER, "--json",
+                                                "apply", "--version", "1.4.239"])
+        self.assertEqual(os.path.dirname(fleet.WINDOWS_HELPER), str(ROOT / "client"))
+
+    def test_windows_self_update_skips_the_local_helper(self):
+        env = FakeEnv([FakeServer("local", local=True), FakeServer("a")])
+        with mock.patch.object(fleet.sys, "platform", "win32"):
+            res = fleet.self_update_servers(env, fleet.select_servers(env.cfg, None))
+        self.assertEqual(list(res), ["a"])
+
+    def test_discover_on_windows_explains_a_missing_desktop_install(self):
+        with mock.patch.object(fleet.sys, "platform", "win32"):
+            rc, out = run(FakeEnv([FakeServer("a")]), ["discover"])
+        self.assertIn("orca-desktop-update found no per-user Orca install (helper_missing)", out)
 
     def test_missing_local_helper_is_reported_not_raised(self):
         with mock.patch.object(fleet.subprocess, "run", side_effect=FileNotFoundError(fleet.HELPER)):
@@ -638,5 +662,6 @@ class LocalDesktopTests(unittest.TestCase):
         self.assertRegex(line, r"\byes\b.*\(local\)")   # enabled
 
     def test_discover_hints_when_no_local_helper(self):
-        rc, out = run(FakeEnv([FakeServer("a")]), ["discover"])
+        with mock.patch.object(fleet.sys, "platform", "linux"):
+            rc, out = run(FakeEnv([FakeServer("a")]), ["discover"])
         self.assertIn("install.sh --desktop", out)
