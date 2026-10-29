@@ -86,7 +86,8 @@ class Env:
 
     def orca(self, args: list[str], timeout: float = 45) -> dict:
         try:
-            cp = subprocess.run([self.cli, *args, "--json"], capture_output=True, text=True, timeout=timeout)
+            cp = subprocess.run([self.cli, *args, "--json"], capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": {"code": "timeout", "message": f"orca {' '.join(args)} timed out"}}
         try:
@@ -108,7 +109,8 @@ class Env:
                     "-o", "ServerAliveCountMax=4", "-o", "ClearAllForwardings=yes", host, "--",
                     " ".join(shlex.quote(x) for x in helper)]
         try:
-            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            cp = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=timeout)
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": {"code": "ssh_timeout", "message": "ssh timed out"}}
         except FileNotFoundError as e:  # local helper (or ssh/sudo) not installed
