@@ -34,14 +34,15 @@ Never run bare `orca` on Linux (GNOME screen reader). The tools use `orca-ide`.
 
 ## This machine's desktop app
 
-A `"local": true` server entry is this machine's .deb desktop Orca, managed by the same helper
-installed with `sudo server/install.sh --desktop`. Without `--all` (or `--server local`) plans
+A `"local": true` server entry is this machine's desktop Orca. On Linux it is the .deb app, managed
+by the same helper installed with `sudo server/install.sh --desktop`; on Windows it is the per-user
+install, managed by `orca-desktop-update` (shipped with the client, no admin rights, no sudo). Without `--all` (or `--server local`) plans
 show it as `skip (local desktop; pass --all)`. With `--all` it goes last: the app window is closed
-(SIGTERM), the package switched, the app relaunched in the user's session and verified, rolled back
+(SIGTERM on Linux, WM_CLOSE on Windows), the package switched, the app relaunched in the user's session and verified, rolled back
 on failure. Warn the user that the window closes and reopens; terminals live in the PTY daemon
 and usually survive. If you run inside that Orca window, your process survives too (it is in the
 daemon), but the UI disappears for a while. If no local entry exists, `orca-fleet discover`
-prints how to install the helper; that needs `sudo`, so ask the user to run it (`! sudo ...`).
+prints how to install the helper; on Linux that needs `sudo`, so ask the user to run it (`! sudo ...`).
 
 ## Approval rule (mandatory)
 

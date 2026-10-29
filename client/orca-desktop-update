@@ -1,0 +1,1244 @@
+#!/usr/bin/env python3
+"""orca-desktop-update: updater for this Windows machine's Orca desktop app.
+
+The Windows counterpart of `orca-serve-update --desktop`. It speaks the same JSON
+protocol (status / check / prepare / apply / rollback / recover), so orca-fleet
+drives a `"local": true` server entry the same way on every platform. It is
+installed next to orca-fleet by client/install.sh and needs no administrator
+rights: Orca's Windows installer is a per-user NSIS setup
+(%LOCALAPPDATA%\\Programs\\orca).
+
+An update quits the app (WM_CLOSE, then a forced kill after
+app_stop_timeout_seconds), runs the official installer silently, relaunches the
+app through Explorer (a clean, job-free process with the shell's environment)
+and verifies the runtime version and process stability, rolling back on
+failure. Terminals live in Orca's PTY daemon, which runs from its own copy under
+%LOCALAPPDATA%\\Orca\\daemon-host-profiles and is never stopped. The switch runs
+in a detached worker process, so it keeps going when the calling terminal or
+client goes away.
+
+Only official stablyai/orca GitHub releases are accepted. Installers are
+verified against the sha256 digest GitHub publishes for each asset, their
+Authenticode signature (SignPath Foundation) and their product version before
+anything runs.
+
+State lives in ~/.local/state/orca-desktop-update, outside AppData: the Microsoft
+Store Python redirects its own new files under AppData into a private folder.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as _dt
+import errno
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+TOOL_VERSION = "1.0.0"
+
+# --- fixed, non-configurable trust anchors ---------------------------------
+GITHUB_REPO = "stablyai/orca"
+GITHUB_API = "https://api.github.com"
+ALLOWED_DOWNLOAD_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+ASSET_NAME = "orca-windows-setup.exe"
+SIGNER = "CN=SignPath Foundation"
+SUPPORTED_ARCHES = {"x64"}
+MAX_INSTALLER_BYTES = 600 * 1024 * 1024
+
+VERSION_RE = re.compile(r"^(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})\Z")
+STABLE_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)\Z")
+OP_ID_RE = re.compile(r"^[0-9a-f]{12}\Z")
+
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+_INSTALL_DIR = os.path.join(_LOCALAPPDATA, "Programs", "orca")
+_STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "orca-desktop-update")
+PATHS = {
+    "install_dir": _INSTALL_DIR,
+    "app": os.path.join(_INSTALL_DIR, "Orca.exe"),
+    "cli": os.path.join(_INSTALL_DIR, "resources", "bin", "orca.exe"),
+    "daemon_root": os.path.join(_LOCALAPPDATA, "Orca", "daemon-host-profiles"),
+    "state_dir": _STATE_DIR,
+    "cache_dir": os.path.join(_STATE_DIR, "cache"),
+    "state": os.path.join(_STATE_DIR, "state.json"),
+    "audit": os.path.join(_STATE_DIR, "audit.jsonl"),
+    "protocols": os.path.join(_STATE_DIR, "daemon-protocols.json"),
+    "lock": os.path.join(_STATE_DIR, "op.lock"),
+    "worker_lock": os.path.join(_STATE_DIR, "worker.lock"),
+    "worker_log": os.path.join(_STATE_DIR, "worker.log"),
+}
+SETTINGS = {"app_stop_timeout_seconds": 30, "safe_idle_seconds": 120, "verify_timeout_seconds": 180,
+            "stability_seconds": 15, "min_free_mb": 1024, "install_timeout_seconds": 600}
+WORKER_ENV = "ORCA_DESKTOP_UPDATE_WORKER"
+
+TERMINAL_RESULTS = {"succeeded", "skipped", "deferred", "rolled_back", "failed", "rollback_failed"}
+
+
+class UpdateError(Exception):
+    """An expected, reportable failure."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _only_deferrals(report: dict) -> bool:
+    """True when every blocker is a SAFE-mode session-protection deferral."""
+    return bool(report.get("blockers")) and set(report["blockers"]) <= set(report.get("deferrals") or [])
+
+
+def now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_version(v: str) -> tuple[int, int, int]:
+    m = VERSION_RE.match(v or "")
+    if not m:
+        raise UpdateError("invalid_version", f"invalid version string: {v!r}")
+    return tuple(int(x) for x in m.groups())  # type: ignore[return-value]
+
+
+def validate_version_arg(v: str) -> str:
+    if v == "latest":
+        return v
+    parse_version(v)
+    return v
+
+
+def same_path(a: str | None, b: str | None) -> bool:
+    return bool(a and b) and os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def under(path: str | None, root: str) -> bool:
+    if not path:
+        return False
+    p, r = os.path.normcase(os.path.normpath(path)), os.path.normcase(os.path.normpath(root))
+    return p.startswith(r + os.sep)
+
+
+# --- Windows boundary (subprocess, registry, processes; injectable for tests) ---
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+CREATE_NO_WINDOW = 0x08000000
+
+_PS_PROLOGUE = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+
+
+class System:
+    def run(self, argv: list[str], *, timeout: float = 120, cwd: str | None = None,
+            env: dict | None = None) -> subprocess.CompletedProcess:
+        if not argv or not isinstance(argv, list):
+            raise ValueError("argv must be a non-empty list")
+        return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, cwd=cwd, env=env, creationflags=CREATE_NO_WINDOW)
+
+    def powershell_json(self, script: str, timeout: float = 60):
+        # a PSModulePath inherited from PowerShell 7 makes Windows PowerShell load the wrong
+        # Microsoft.PowerShell.Security (Get-AuthenticodeSignature then fails to import)
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        cp = self.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                       "-Command", _PS_PROLOGUE + script], timeout=timeout, env=env)
+        if cp.returncode != 0:
+            raise UpdateError("powershell_failed", (cp.stderr or cp.stdout).strip()[:400])
+        try:
+            return json.loads(cp.stdout or "null")
+        except json.JSONDecodeError as e:
+            raise UpdateError("powershell_failed", f"unreadable PowerShell output: {cp.stdout[:200]!r}") from e
+
+    def processes(self) -> list[dict]:
+        rows = self.powershell_json(
+            "@(Get-CimInstance Win32_Process -Filter \"Name='Orca.exe'\" | ForEach-Object { "
+            "[pscustomobject]@{pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; "
+            "path=$_.ExecutablePath; cmd=$_.CommandLine} }) | ConvertTo-Json -Compress -Depth 2")
+        return [r for r in (rows if isinstance(rows, list) else [rows] if rows else []) if isinstance(r, dict)]
+
+    def children(self, pids: list[int]) -> list[int]:
+        if not pids:
+            return []
+        flt = " or ".join(f"ParentProcessId={int(p)}" for p in pids)
+        rows = self.powershell_json(f"@(Get-CimInstance Win32_Process -Filter \"{flt}\" | "
+                                    "ForEach-Object { [int]$_.ProcessId }) | ConvertTo-Json -Compress")
+        return sorted(int(x) for x in (rows if isinstance(rows, list) else [rows] if rows else []))
+
+    def pids_alive(self, pids: list[int]) -> list[int]:
+        if not pids:
+            return []
+        flt = " or ".join(f"ProcessId={int(p)}" for p in pids)
+        rows = self.powershell_json(f"@(Get-CimInstance Win32_Process -Filter \"{flt}\" | "
+                                    "ForEach-Object { [int]$_.ProcessId }) | ConvertTo-Json -Compress")
+        return sorted(int(x) for x in (rows if isinstance(rows, list) else [rows] if rows else []))
+
+    def uninstall_entries(self) -> list[dict]:
+        import winreg
+        out = []
+        base = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        try:
+            root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+        except OSError:
+            return out
+        with root:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, name) as k:
+                        vals = {}
+                        for field in ("DisplayName", "DisplayVersion", "Publisher", "UninstallString"):
+                            try:
+                                vals[field] = str(winreg.QueryValueEx(k, field)[0])
+                            except OSError:
+                                vals[field] = ""
+                        out.append(vals)
+                except OSError:
+                    continue
+        return out
+
+    def installer_facts(self, path: str) -> dict:
+        lit = path.replace("'", "''")
+        return self.powershell_json(
+            f"$s = Get-AuthenticodeSignature -LiteralPath '{lit}'; $v = (Get-Item -LiteralPath '{lit}').VersionInfo; "
+            "[pscustomobject]@{status=[string]$s.Status; signer=[string]$s.SignerCertificate.Subject; "
+            "product_version=[string]$v.ProductVersion; product_name=[string]$v.ProductName} "
+            "| ConvertTo-Json -Compress", timeout=120) or {}
+
+    def close_window(self, pid: int) -> None:
+        self.run(["taskkill.exe", "/PID", str(int(pid))], timeout=30)
+
+    def kill(self, pid: int) -> None:
+        self.run(["taskkill.exe", "/F", "/PID", str(int(pid))], timeout=30)
+
+    def open_app(self, app: str) -> None:
+        """Start the app through Explorer: outside our job, with the shell's environment."""
+        self.run(["explorer.exe", app], timeout=60)  # explorer exits 1 even on success
+
+    def spawn_detached(self, argv: list[str], log_path: str, env: dict) -> int:
+        with open(log_path, "ab") as log:
+            kw = dict(stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, close_fds=True)
+            flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            try:
+                p = subprocess.Popen(argv, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kw)
+            except OSError:  # the job we run in does not allow breakaway
+                p = subprocess.Popen(argv, creationflags=flags, **kw)
+        return p.pid
+
+    def arch(self) -> str:
+        m = platform.machine().upper()
+        return "x64" if m in {"AMD64", "X86_64"} else m.lower()
+
+
+# --- HTTP (official GitHub only) -------------------------------------------
+class _RestrictedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _check_url(url: str) -> None:
+    p = urllib.parse.urlparse(url)
+    if p.scheme != "https" or (p.hostname or "") not in ALLOWED_DOWNLOAD_HOSTS:
+        raise UpdateError("forbidden_url", f"refusing non-official URL: {url}")
+
+
+class Http:
+    def __init__(self) -> None:
+        self._opener = urllib.request.build_opener(_RestrictedRedirect())
+
+    def get_json(self, url: str, timeout: float = 30):
+        _check_url(url)
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"orca-desktop-update/{TOOL_VERSION}",
+        })
+        try:
+            with self._opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read(5 * 1024 * 1024).decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise UpdateError("github_http_error", f"GitHub API {e.code} for {url}") from e
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+            raise UpdateError("network_error", f"cannot reach GitHub: {e}") from e
+
+    def download(self, url: str, fd: int, max_bytes: int, timeout: float = 60) -> str:
+        """Stream url into fd; return sha256 hex."""
+        _check_url(url)
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": f"orca-desktop-update/{TOOL_VERSION}",
+        })
+        h = hashlib.sha256()
+        total = 0
+        try:
+            with self._opener.open(req, timeout=timeout) as resp:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise UpdateError("download_too_large", "download exceeds size limit")
+                    h.update(chunk)
+                    _write_all(fd, chunk)
+        except urllib.error.HTTPError as e:
+            raise UpdateError("download_failed", f"HTTP {e.code} downloading {url}") from e
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+            raise UpdateError("download_failed", f"network error downloading {url}: {e}") from e
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise UpdateError("disk_full", "no space left while downloading") from e
+            raise
+        return h.hexdigest()
+
+
+class CurlHttp(Http):
+    """HTTP through Windows' own curl.exe (Schannel).
+
+    Python's OpenSSL only trusts the roots already in the Windows store and cannot fetch missing
+    issuers, so it rejects GitHub edges whose chain ends in a root Windows installs on demand
+    (e.g. Sectigo E46). Schannel validates them like any browser. Integrity does not depend on
+    the transport: installers are still checked against GitHub's sha256 and their signature.
+    """
+
+    def __init__(self, curl: str) -> None:
+        super().__init__()
+        self.curl = curl
+
+    def _argv(self, url: str, accept: str) -> list[str]:
+        return [self.curl, "--silent", "--show-error", "--fail", "--location", "--max-redirs", "5",
+                "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "30",
+                "-H", f"Accept: {accept}", "-H", f"User-Agent: orca-desktop-update/{TOOL_VERSION}"]
+
+    def get_json(self, url: str, timeout: float = 30):
+        _check_url(url)
+        cp = subprocess.run(self._argv(url, "application/vnd.github+json")
+                            + ["--write-out", "\n%{url_effective}", url],
+                            capture_output=True, timeout=timeout + 30, creationflags=CREATE_NO_WINDOW)
+        body, _, effective = cp.stdout.rpartition(b"\n")
+        if cp.returncode != 0:
+            err = cp.stderr.decode("utf-8", "replace").strip()
+            code = "github_http_error" if cp.returncode == 22 else "network_error"
+            raise UpdateError(code, f"GitHub request failed for {url}: {err[:300]}")
+        _check_url(effective.decode("utf-8", "replace").strip())
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise UpdateError("network_error", f"unreadable GitHub response for {url}") from e
+
+    def download(self, url: str, fd: int, max_bytes: int, timeout: float = 60) -> str:
+        _check_url(url)
+        argv = self._argv(url, "application/octet-stream") + ["--max-filesize", str(max_bytes),
+                                                              "--speed-time", str(int(timeout)),
+                                                              "--speed-limit", "1", url]
+        h = hashlib.sha256()
+        total = 0
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
+        try:
+            while True:
+                chunk = p.stdout.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise UpdateError("download_too_large", "download exceeds size limit")
+                h.update(chunk)
+                try:
+                    _write_all(fd, chunk)
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:
+                        raise UpdateError("disk_full", "no space left while downloading") from e
+                    raise
+        finally:
+            if p.poll() is None:
+                p.kill()
+            err = p.stderr.read().decode("utf-8", "replace").strip()
+            p.wait()
+        if p.returncode != 0:
+            raise UpdateError("download_failed", f"curl exited {p.returncode} downloading {url}: {err[:300]}")
+        return h.hexdigest()
+
+
+def default_http() -> Http:
+    curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+    return CurlHttp(curl) if os.name == "nt" and os.path.isfile(curl) else Http()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+# --- release metadata -------------------------------------------------------
+def _release_info(rel: dict) -> dict:
+    tag = rel.get("tag_name", "")
+    m = STABLE_TAG_RE.match(tag)
+    if not m:
+        raise UpdateError("not_stable_release", f"release tag {tag!r} is not a stable vX.Y.Z tag")
+    if rel.get("prerelease") or rel.get("draft"):
+        raise UpdateError("not_stable_release", f"release {tag} is a prerelease/draft")
+    version = m.group(1)
+    parse_version(version)
+    for a in rel.get("assets", []):
+        if a.get("name") == ASSET_NAME:
+            digest = a.get("digest") or ""
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise UpdateError("missing_checksum", f"{ASSET_NAME} has no sha256 digest in release metadata")
+            url = a.get("browser_download_url", "")
+            expected = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{ASSET_NAME}"
+            if url != expected:
+                raise UpdateError("forbidden_url", f"unexpected asset URL for {ASSET_NAME}: {url}")
+            size = int(a.get("size") or 0)
+            if not 0 < size <= MAX_INSTALLER_BYTES:
+                raise UpdateError("bad_asset", f"unexpected asset size {size} for {ASSET_NAME}")
+            return {"version": version, "tag": tag, "asset": ASSET_NAME, "url": url,
+                    "sha256": digest.split(":", 1)[1], "size": size, "published_at": rel.get("published_at")}
+    raise UpdateError("asset_not_found", f"release {tag} has no {ASSET_NAME}")
+
+
+def resolve_release(http: Http, version: str) -> dict:
+    if version == "latest":
+        rels = http.get_json(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases?per_page=40")
+        stable = []
+        for r in rels if isinstance(rels, list) else []:
+            m = STABLE_TAG_RE.match(r.get("tag_name", ""))
+            if m and not r.get("prerelease") and not r.get("draft") and VERSION_RE.match(m.group(1)):
+                stable.append((parse_version(m.group(1)), r))
+        if not stable:
+            raise UpdateError("no_stable_release", "no stable release found")
+        stable.sort(key=lambda x: x[0], reverse=True)
+        return _release_info(stable[0][1])
+    parse_version(version)
+    return _release_info(http.get_json(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases/tags/v{version}"))
+
+
+# --- small file helpers -----------------------------------------------------
+def atomic_write_json(path: str, data) -> None:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-", suffix=".json")
+    try:
+        _write_all(fd, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def read_json(path: str, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class FileLock:
+    """Exclusive, non-blocking lock released by the OS when the holder exits."""
+
+    def __init__(self, path: str, busy_message: str):
+        self.path, self.busy_message, self.fd = path, busy_message, -1
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            self.fd = -1
+            raise UpdateError("locked", self.busy_message) from None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd >= 0:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+            os.close(self.fd)
+            self.fd = -1
+
+
+# --- the updater ------------------------------------------------------------
+class Updater:
+    def __init__(self, system: System | None = None, http: Http | None = None, paths: dict | None = None,
+                 settings: dict | None = None, sleep=time.sleep, clock=time.monotonic) -> None:
+        self.sys = system or System()
+        self.http = http or default_http()
+        self.paths = dict(PATHS, **(paths or {}))
+        self.cfg = dict(SETTINGS, **(settings or {}))
+        self.sleep = sleep
+        self.clock = clock
+
+    # ---------- audit / state ----------
+    def audit(self, event: str, **fields) -> None:
+        rec = {"ts": now_iso(), "event": event, "host": socket.gethostname(), **fields}
+        try:
+            with open(self.paths["audit"], "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass  # never fail on audit
+
+    def load_state(self) -> dict:
+        return read_json(self.paths["state"], default={}) or {}
+
+    def save_state(self, st: dict) -> None:
+        st["updated_at"] = now_iso()
+        atomic_write_json(self.paths["state"], st)
+
+    def set_phase(self, st: dict, phase: str, **extra) -> None:
+        st["phase"] = phase
+        st.setdefault("history", []).append({"ts": now_iso(), "phase": phase, **extra})
+        st.update(extra)
+        self.save_state(st)
+        self.audit("phase", op_id=st.get("op_id"), phase=phase, **extra)
+
+    def init_dirs(self) -> None:
+        os.makedirs(self.paths["cache_dir"], exist_ok=True)
+
+    def lock(self) -> FileLock:
+        return FileLock(self.paths["lock"], "another orca-desktop-update operation is running")
+
+    # ---------- system facts ----------
+    def installed(self) -> bool:
+        return os.path.isfile(self.paths["app"])
+
+    def arch(self) -> str:
+        a = self.sys.arch()
+        if a not in SUPPORTED_ARCHES:
+            raise UpdateError("unsupported_arch", f"unsupported architecture {a!r} (only x64 installers exist)")
+        return a
+
+    def installed_version(self) -> str | None:
+        """DisplayVersion of the per-user uninstall entry the installer writes for this install dir."""
+        for e in self.sys.uninstall_entries():
+            if e.get("DisplayName") == "Orca" and under(e.get("UninstallString", "").strip('"').split('"')[0],
+                                                        self.paths["install_dir"]):
+                v = e.get("DisplayVersion") or ""
+                return v if VERSION_RE.match(v) else v or None
+        return None
+
+    def app_processes(self) -> list[dict]:
+        return [p for p in self.sys.processes() if under(p.get("path"), self.paths["install_dir"])]
+
+    def desktop_app_pid(self, procs: list[dict] | None = None) -> int | None:
+        """Main process of the app: Orca.exe from the install dir with no --type and no script argument."""
+        procs = self.app_processes() if procs is None else procs
+        mains = [p for p in procs if same_path(p.get("path"), self.paths["app"])
+                 and "--type=" not in (p.get("cmd") or "") and ".js" not in (p.get("cmd") or "")]
+        pids = {p["pid"] for p in mains}
+        roots = [p["pid"] for p in mains if p.get("ppid") not in pids]
+        return min(roots) if roots else None
+
+    def service_state(self) -> dict:
+        pid = self.desktop_app_pid()
+        return {"kind": "desktop", "ActiveState": "active" if pid else "inactive",
+                "SubState": "running" if pid else "dead", "MainPID": pid or 0, "NRestarts": 0}
+
+    def orca_cli_json(self, args: list[str], timeout: float = 30) -> dict | None:
+        try:
+            cp = self.sys.run([self.paths["cli"], *args, "--json"], timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        try:
+            return json.loads(cp.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def runtime_status(self) -> dict:
+        d = self.orca_cli_json(["status"], timeout=20)
+        if not d or not d.get("ok"):
+            return {"reachable": False, "error": (d or {}).get("error")}
+        rt = d.get("result", {}).get("runtime", {})
+        return {"reachable": bool(rt.get("reachable")), "state": rt.get("state"),
+                "appVersion": rt.get("appVersion"), "runtimeId": rt.get("runtimeId")}
+
+    # ---------- session / agent activity ----------
+    def activity(self) -> dict:
+        """Summarise agents from `orca worktree ps --json` (same rules as orca-serve-update)."""
+        d = self.orca_cli_json(["worktree", "ps"], timeout=40)
+        if not d or not d.get("ok"):
+            return {"known": False, "reason": "worktree ps unavailable", "busy": [], "monitoring": [],
+                    "blocked": [], "agents": 0, "live_terminals": None}
+        res = d.get("result") or {}
+        busy, monitoring, blocked = [], [], []
+        agents = live = unverifiable = 0
+        for w in res.get("worktrees", []) if isinstance(res, dict) else []:
+            if not isinstance(w, dict):
+                continue
+            live += int(w.get("liveTerminalCount") or 0)
+            unverifiable += int(w.get("unverifiableTerminalCount") or 0)
+            for a in w.get("agents") or []:
+                if not isinstance(a, dict):
+                    continue
+                agents += 1
+                item = {"agent": a.get("agentType"), "worktree": w.get("displayName") or w.get("branch"),
+                        "state": a.get("state"), "since": a.get("stateStartedAt"),
+                        "title": (a.get("taskTitle") or a.get("displayName") or a.get("prompt") or "")[:80]}
+                if a.get("state") == "working":
+                    (monitoring if a.get("workingMode") == "monitoring" else busy).append(item)
+                elif a.get("state") == "blocked":
+                    blocked.append(item)
+        return {"known": True, "agents": agents, "live_terminals": live,
+                "unverifiable_terminals": unverifiable, "busy": busy, "monitoring": monitoring,
+                "blocked": blocked, "truncated": bool(res.get("truncated"))}
+
+    def daemon_processes(self) -> list[dict]:
+        """PTY daemons: Orca.exe copies under daemon-host-profiles\\<profile>\\<version>\\<build>\\.
+
+        Unlike Linux, the protocol is not in the process arguments; it is read from the source of the
+        release the daemon was copied from (the version in its path).
+        """
+        root = self.paths["daemon_root"]
+        out = []
+        for p in self.sys.processes():
+            path = p.get("path")
+            if not under(path, root) or "--type=" in (p.get("cmd") or ""):
+                continue
+            parts = os.path.relpath(path, root).split(os.sep)
+            version = parts[1] if len(parts) >= 4 and VERSION_RE.match(parts[1]) else None
+            out.append({"pid": p["pid"], "version": version, "protocol": self.daemon_protocol(version)})
+        return sorted(out, key=lambda d: d["pid"])
+
+    def daemon_protocol(self, version: str | None) -> int | None:
+        if not version:
+            return None
+        cache = read_json(self.paths["protocols"], default={}) or {}
+        if version in cache:
+            return cache[version]
+        try:
+            proto = self.protocol_facts(version)["protocol"]
+        except UpdateError:
+            return None
+        cache[version] = proto
+        try:
+            atomic_write_json(self.paths["protocols"], cache)
+        except OSError:
+            pass
+        return proto
+
+    def protocol_facts(self, version: str) -> dict:
+        """Daemon protocol facts of an official release, read from its tagged source."""
+        parse_version(version)
+        url = (f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/src/main/daemon/daemon-protocol-version.ts"
+               f"?ref=v{version}")
+        meta = self.http.get_json(url)
+        src = base64.b64decode(meta.get("content", "")).decode("utf-8", "replace")
+        cur = re.findall(r"^export const PROTOCOL_VERSION\b[^=\n]*=\s*(\d+)\s*$", src, re.M)
+        prev = re.findall(r"^export const PREVIOUS_DAEMON_PROTOCOL_VERSIONS\b[^=\n]*=\s*\[([^\]]*)\]", src, re.M)
+        if len(cur) != 1 or len(prev) != 1:
+            raise UpdateError("protocol_facts_unreadable", f"cannot parse daemon protocol facts for {version}")
+        return {"protocol": int(cur[0]), "previous": sorted({int(x) for x in re.findall(r"\d+", prev[0])})}
+
+    @staticmethod
+    def can_attach(facts: dict, owner_protocol: int) -> bool:
+        return owner_protocol == facts["protocol"] or owner_protocol in facts["previous"]
+
+    def pty_sessions(self, daemons: list[int]) -> list[int]:
+        """Terminal processes (direct children of the PTY daemons)."""
+        try:
+            return self.sys.children(daemons)
+        except UpdateError:
+            return []
+
+    # ---------- desktop app ----------
+    def stop_desktop_app(self, st: dict) -> None:
+        """Close the window (WM_CLOSE), force-kill if it hangs, then end the app's leftover helpers.
+
+        Only processes running from the install dir are touched; the PTY daemon runs from its own
+        copy elsewhere, so terminals keep running.
+        """
+        pid = self.desktop_app_pid()
+        if pid:
+            self.sys.close_window(pid)
+            deadline = self.clock() + self.cfg["app_stop_timeout_seconds"]
+            while self.clock() < deadline and self.desktop_app_pid() == pid:
+                self.sleep(1)
+            if self.desktop_app_pid() == pid:
+                st["app_killed"] = pid
+                self.sys.kill(pid)
+        for _ in range(15):
+            left = self.app_processes()
+            if not left:
+                return
+            for p in left:
+                self.sys.kill(p["pid"])
+            self.sleep(1)
+        raise UpdateError("stop_failed", f"Orca processes did not exit: {[p['pid'] for p in self.app_processes()]}")
+
+    def start_desktop_app(self) -> None:
+        try:
+            self.sys.open_app(self.paths["app"])
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise UpdateError("start_failed", f"cannot relaunch the Orca desktop app: {e}") from e
+        for _ in range(30):
+            if self.desktop_app_pid():
+                return
+            self.sleep(1)
+        raise UpdateError("start_failed", "the Orca desktop app did not start")
+
+    # ---------- cache ----------
+    def cache_path(self, version: str) -> str:
+        parse_version(version)
+        return os.path.join(self.paths["cache_dir"], f"orca-windows-setup-{version}.exe")
+
+    def meta_path(self, version: str) -> str:
+        return self.cache_path(version) + ".json"
+
+    def _check_installer(self, path: str, version: str) -> None:
+        f = self.sys.installer_facts(path)
+        problems = []
+        if f.get("status") != "Valid":
+            problems.append(f"signature {f.get('status')!r}")
+        if not str(f.get("signer") or "").startswith(SIGNER + ","):
+            problems.append(f"signer {f.get('signer')!r}")
+        if ".".join(str(f.get("product_version") or "").split(".")[:3]) != version:  # "1.4.240" or "1.4.240.0"
+            problems.append(f"product version {f.get('product_version')!r}")
+        if problems:
+            raise UpdateError("bad_package", f"{os.path.basename(path)}: " + ", ".join(problems))
+
+    def verify_cached(self, version: str) -> dict:
+        path = self.cache_path(version)
+        meta = read_json(self.meta_path(version))
+        if not meta or not os.path.isfile(path):
+            raise UpdateError("not_prepared", f"{version} is not prepared")
+        if sha256_file(path) != meta.get("sha256"):
+            raise UpdateError("checksum_mismatch", f"cached {version} does not match recorded sha256")
+        self._check_installer(path, version)
+        return meta
+
+    def fetch(self, rel: dict) -> dict:
+        """Download + verify one release installer into the cache (idempotent)."""
+        version = rel["version"]
+        final = self.cache_path(version)
+        meta = read_json(self.meta_path(version))
+        if meta and meta.get("sha256") == rel["sha256"] and os.path.exists(final):
+            try:
+                self.verify_cached(version)
+                return {"version": version, "cached": True, "path": final}
+            except UpdateError:
+                pass
+        free = shutil.disk_usage(self.paths["cache_dir"]).free
+        if free < rel["size"] * 2 + 256 * 1024 * 1024:
+            raise UpdateError("disk_full", f"not enough free space in {self.paths['cache_dir']} "
+                                           f"({free // 2**20} MiB free)")
+        fd, tmp = tempfile.mkstemp(dir=self.paths["cache_dir"], prefix=".dl-", suffix=".exe")
+        try:
+            digest = self.http.download(rel["url"], fd, max_bytes=min(MAX_INSTALLER_BYTES, rel["size"] + 1))
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            if os.path.getsize(tmp) != rel["size"]:
+                raise UpdateError("download_incomplete", "downloaded size differs from release metadata")
+            if digest != rel["sha256"]:
+                raise UpdateError("checksum_mismatch",
+                                  f"sha256 mismatch for {rel['asset']} {version}: got {digest}, want {rel['sha256']}")
+            self._check_installer(tmp, version)
+            os.replace(tmp, final)
+            tmp = ""
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        facts = None
+        try:
+            facts = self.protocol_facts(version)
+        except UpdateError:
+            pass  # recorded as unknown; SAFE preflight then treats crossing as unverifiable
+        atomic_write_json(self.meta_path(version), {**rel, "fetched_at": now_iso(), "daemon_protocol": facts})
+        return {"version": version, "cached": False, "path": final, "daemon_protocol": facts}
+
+    def prepared_versions(self) -> list[str]:
+        try:
+            names = os.listdir(self.paths["cache_dir"])
+        except OSError:
+            return []
+        return sorted((m.group(1) for n in names if (m := re.fullmatch(r"orca-windows-setup-(\d+\.\d+\.\d+)\.exe", n))),
+                      key=parse_version)
+
+    def prune(self, keep: set[str]) -> list[str]:
+        removed = []
+        for name in os.listdir(self.paths["cache_dir"]):
+            m = re.fullmatch(r"orca-windows-setup-(\d+\.\d+\.\d+)\.exe(\.json)?", name)
+            if m and m.group(1) not in keep:
+                os.unlink(os.path.join(self.paths["cache_dir"], name))
+                removed.append(name)
+        return removed
+
+    # ---------- subcommands ----------
+    def cmd_status(self) -> dict:
+        out: dict = {"host": socket.gethostname(), "tool_version": TOOL_VERSION, "ts": now_iso(),
+                     "platform": "windows"}
+        if self.installed():
+            out["service"] = {"app": self.paths["app"], **self.service_state()}
+        else:
+            out["config_error"] = f"Orca desktop app not found at {self.paths['app']} (per-user install)"
+        out["installed_version"] = self.installed_version()
+        try:
+            out["arch"] = self.arch()
+        except UpdateError as e:
+            out["arch_error"] = e.message
+        if self.installed():
+            out["runtime"] = self.runtime_status()
+            out["activity"] = self.activity()
+            out["daemons"] = self.daemon_processes()
+        st = self.load_state()
+        out["state"] = st
+        out["worker_active"] = self.worker_active()
+        if st.get("phase") and st.get("result") is None and not out["worker_active"]:
+            out["stale_operation"] = True  # crashed mid-update: run `recover`
+        out["prepared_versions"] = self.prepared_versions()
+        out["helper"] = None
+        return out
+
+    def worker_active(self) -> bool:
+        if not os.path.exists(self.paths["worker_lock"]):
+            return False
+        try:
+            with FileLock(self.paths["worker_lock"], ""):
+                return False
+        except UpdateError:
+            return True
+
+    def cmd_check(self, version: str) -> dict:
+        self.arch()
+        rel = resolve_release(self.http, version)
+        cur = self.installed_version()
+        needs = cur is None or not VERSION_RE.match(cur or "") or parse_version(cur) != parse_version(rel["version"])
+        return {"installed_version": cur, "target": rel, "needs_update": needs,
+                "is_downgrade": bool(cur and VERSION_RE.match(cur) and parse_version(cur) > parse_version(rel["version"]))}
+
+    def cmd_prepare(self, version: str, dry_run: bool = False) -> dict:
+        if not self.installed():
+            raise UpdateError("not_installed", f"Orca desktop app not found at {self.paths['app']}")
+        self.init_dirs()
+        arch = self.arch()
+        target = resolve_release(self.http, version)
+        current = self.installed_version()
+        result = {"target": target["version"], "installed_version": current, "arch": arch}
+        rollback = None
+        if current and VERSION_RE.match(current) and current != target["version"]:
+            rollback = resolve_release(self.http, current)
+        if dry_run:
+            result.update(dry_run=True, would_fetch=[f"{ASSET_NAME} {target['version']}"]
+                          + ([f"{ASSET_NAME} {rollback['version']}"] if rollback else []))
+            return result
+        self.audit("prepare_start", target=target["version"], current=current)
+        with self.lock():
+            result["fetched"] = [self.fetch(target)]
+            if rollback:
+                result["fetched"].append(self.fetch(rollback))
+            result["pruned"] = self.prune({target["version"]} | ({current} if current else set()))
+        st = self.load_state()
+        st["prepared"] = {"target": target["version"], "rollback": current, "arch": arch, "at": now_iso()}
+        self.save_state(st)
+        self.audit("prepare_done", target=target["version"], rollback=current)
+        result["ok"] = True
+        return result
+
+    def preflight(self, version: str, mode: str, in_worker: bool = False) -> dict:
+        """Read-only checks that decide whether an update may start."""
+        current = self.installed_version()
+        report: dict = {"target": version, "installed_version": current, "mode": mode, "blockers": [],
+                        "warnings": []}
+        if not in_worker and self.worker_active():
+            # checked first: a running op may be mid-switch, so version equality means nothing yet
+            report["blockers"].append("an update worker is already running")
+            return report
+        if current == version:
+            report["skip"] = "already at target version"
+            return report
+        if not self.installed():
+            report["blockers"].append(f"Orca desktop app not found at {self.paths['app']}")
+            return report
+        try:
+            self.verify_cached(version)
+        except (UpdateError, FileNotFoundError) as e:
+            report["blockers"].append(f"target not prepared/verified: {getattr(e, 'message', e)}")
+        if current and VERSION_RE.match(current):
+            try:
+                self.verify_cached(current)
+            except (UpdateError, FileNotFoundError) as e:
+                report["blockers"].append(f"rollback package for {current} not available: {getattr(e, 'message', e)}")
+        else:
+            report["blockers"].append("installed version unknown; rollback impossible")
+        free_mb = min(shutil.disk_usage(self.paths["install_dir"]).free,
+                      shutil.disk_usage(self.paths["cache_dir"]).free) // 2**20
+        if free_mb < self.cfg["min_free_mb"]:
+            report["blockers"].append(f"only {free_mb} MiB free (< {self.cfg['min_free_mb']})")
+        act = self.activity()
+        report["activity"] = act
+        daemons = self.daemon_processes()
+        report["daemons"] = daemons
+        report["deferrals"] = []
+
+        def block(msg: str) -> None:
+            if mode == "safe":
+                report["blockers"].append(msg)
+                report["deferrals"].append(msg)
+            else:
+                report["warnings"].append(msg)
+
+        suffix = " (SAFE mode defers)" if mode == "safe" else " (FORCE mode proceeds)"
+        if not act["known"]:
+            block("cannot determine running agents (Orca runtime not queryable)" + suffix)
+        else:
+            if act["busy"]:
+                block(f"{len(act['busy'])} agent(s) are running a turn" + suffix)
+            if act["monitoring"]:
+                report["warnings"].append(f"{len(act['monitoring'])} agent(s) in monitoring loops (not blocking)")
+            if act["blocked"]:
+                report["warnings"].append(f"{len(act['blocked'])} agent(s) waiting for permission (not blocking)")
+        if daemons or act.get("live_terminals"):
+            meta = read_json(self.meta_path(version)) or {}
+            facts = meta.get("daemon_protocol")
+            report["incoming_daemon_protocol"] = facts
+            if not facts:
+                block("daemon protocol compatibility of the target is unverifiable" + suffix)
+            elif any(d["protocol"] is None for d in daemons):
+                block("protocol of a running PTY daemon is unknown" + suffix)
+            else:
+                stranded = [d for d in daemons if not self.can_attach(facts, d["protocol"])]
+                report["session_crossing"] = "strands-live-terminals" if stranded else "attachable"
+                if stranded:
+                    block(f"target cannot attach daemon protocol(s) {sorted({d['protocol'] for d in stranded})}; "
+                          "live terminals would be stranded" + suffix)
+                else:
+                    report["warnings"].append(
+                        "live terminals stay on their current daemon (Orca protocol rule says attachable); "
+                        "this is Orca's documented behavior, not a guarantee")
+        else:
+            report["session_crossing"] = "no-live-terminals"
+        return report
+
+    def cmd_apply(self, version: str, mode: str, dry_run: bool = False, allow_downgrade: bool = False) -> dict:
+        parse_version(version)
+        if mode not in {"safe", "force"}:
+            raise UpdateError("bad_mode", "mode must be safe or force")
+        self.init_dirs()
+        current = self.installed_version()
+        if current and VERSION_RE.match(current) and parse_version(current) > parse_version(version) \
+                and not allow_downgrade:
+            raise UpdateError("downgrade_refused", f"{version} is older than installed {current}; "
+                                                   "pass --allow-downgrade (or use rollback)")
+        report = self.preflight(version, mode)
+        if report.get("skip"):
+            self.audit("apply_skipped", target=version, reason=report["skip"])
+            return {**report, "result": "skipped"}
+        if report["blockers"]:
+            res = "deferred" if _only_deferrals(report) else "blocked"
+            self.audit("apply_refused", target=version, mode=mode, blockers=report["blockers"])
+            return {**report, "result": res}
+        if dry_run:
+            return {**report, "result": "dry_run_ok"}
+        op_id = uuid.uuid4().hex[:12]
+        return self._spawn_worker(["update", "--version", version, "--mode", mode], op_id, {**report, "op": "update"})
+
+    def cmd_rollback(self, to: str | None, dry_run: bool = False) -> dict:
+        self.init_dirs()
+        st = self.load_state()
+        target = to or st.get("last_success_previous") or (st.get("prepared") or {}).get("rollback")
+        if not target:
+            raise UpdateError("no_rollback_target", "no previous version recorded; pass --to X.Y.Z")
+        parse_version(target)
+        self.verify_cached(target)
+        if self.worker_active():
+            raise UpdateError("locked", "an update worker is already running")
+        if dry_run:
+            return {"result": "dry_run_ok", "rollback_to": target, "installed_version": self.installed_version()}
+        op_id = uuid.uuid4().hex[:12]
+        return self._spawn_worker(["rollback", "--version", target], op_id, {"op": "rollback", "target": target})
+
+    def cmd_recover(self) -> dict:
+        st = self.load_state()
+        if not st.get("phase") or st.get("result") is not None:
+            return {"result": "nothing_to_recover", "state": st}
+        if self.worker_active():
+            return {"result": "worker_still_running", "state": st}
+        op_id = uuid.uuid4().hex[:12]
+        return self._spawn_worker(["recover"], op_id, {"op": "recover", "interrupted_op": st.get("op_id")})
+
+    def _spawn_worker(self, args: list[str], op_id: str, info: dict) -> dict:
+        """Hand the operation to a detached process that outlives this one (and the calling terminal)."""
+        if self.worker_active():
+            raise UpdateError("locked", "an update worker is already running")
+        argv = [sys.executable, "-I", os.path.abspath(__file__), "--json", "_worker", *args, "--op-id", op_id]
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
+        env[WORKER_ENV] = op_id
+        try:
+            pid = self.sys.spawn_detached(argv, self.paths["worker_log"], env)
+        except OSError as e:
+            raise UpdateError("spawn_failed", f"cannot start the update worker: {e}") from e
+        # wait until the worker holds its lock, so a second apply cannot start another one
+        for _ in range(40):
+            if self.worker_active() or self.load_state().get("op_id") == op_id:
+                break
+            if not self.sys.pids_alive([pid]):
+                break
+            self.sleep(0.25)
+        self.audit("worker_spawned", op_id=op_id, args=args, pid=pid)
+        return {**info, "result": "started", "op_id": op_id, "unit": f"orca-desktop-update worker (pid {pid})"}
+
+    # ---------- worker (runs in the detached process) ----------
+    def worker(self, kind: str, version: str | None, mode: str | None, op_id: str) -> int:
+        if not OP_ID_RE.match(op_id):
+            raise UpdateError("bad_op_id", "invalid op id")
+        self.init_dirs()
+        with FileLock(self.paths["worker_lock"], "an update worker is already running"), self.lock():
+            if kind == "update":
+                return self._worker_update(version, mode, op_id)
+            if kind == "rollback":
+                return self._worker_rollback(version, op_id)
+            if kind == "recover":
+                return self._worker_recover(op_id)
+        raise UpdateError("bad_worker", kind)
+
+    def _new_op(self, op_id: str, kind: str, **extra) -> dict:
+        prev = self.load_state()
+        st = {"op_id": op_id, "op": kind, "started_at": now_iso(), "result": None, "history": [],
+              "requested_by": os.environ.get("USERNAME") or None,
+              "prepared": prev.get("prepared"),
+              "last_success_previous": prev.get("last_success_previous"), **extra}
+        if prev.get("op_id"):
+            st["previous_op"] = {k: prev.get(k) for k in ("op_id", "op", "result", "target", "error")}
+        self.save_state(st)
+        return st
+
+    def _finish(self, st: dict, result: str, **extra) -> int:
+        st.update(result=result, finished_at=now_iso(), **extra)
+        self.set_phase(st, "done", result=result)
+        return 0 if result in {"succeeded", "skipped", "deferred", "rolled_back"} else 1
+
+    def _worker_update(self, version: str, mode: str, op_id: str) -> int:
+        current = self.installed_version()
+        st = self._new_op(op_id, "update", target=version, previous=current, mode=mode)
+        self.set_phase(st, "preflight")
+        report = self.preflight(version, mode, in_worker=True)  # re-check: state may have changed
+        st["preflight"] = report
+        if report.get("skip"):
+            return self._finish(st, "skipped", reason=report["skip"])
+        if report["blockers"]:
+            res = "deferred" if _only_deferrals(report) else "failed"
+            return self._finish(st, res, error="; ".join(report["blockers"]))
+        daemons = [d["pid"] for d in report.get("daemons") or []]
+        sessions = self.pty_sessions(daemons)
+        st["pty_daemons_before"] = daemons
+        st["pty_sessions_before"] = len(sessions)
+        try:
+            self._switch(st, version)
+            self._verify(st, version)
+        except UpdateError as e:
+            st["error"] = f"{e.code}: {e.message}"
+            self.audit("update_failed", op_id=op_id, error=st["error"])
+            return self._rollback_after_failure(st, current)
+        st["pty_daemons_after"] = self.sys.pids_alive(daemons)
+        st["pty_daemons_replaced"] = sorted(set(daemons) - set(st["pty_daemons_after"]))
+        lost = sorted(set(sessions) - set(self.sys.pids_alive(sessions)))
+        st["pty_sessions_lost"] = len(lost)
+        st["sessions_preserved"] = not lost
+        st["last_success_previous"] = current
+        return self._finish(st, "succeeded")
+
+    def _rollback_after_failure(self, st: dict, previous: str | None) -> int:
+        if not previous:
+            return self._finish(st, "rollback_failed", rollback_error="no previous version known")
+        try:
+            self.set_phase(st, "rollback")
+            self._switch(st, previous)
+            self._verify(st, previous)
+            return self._finish(st, "rolled_back")
+        except UpdateError as e:
+            return self._finish(st, "rollback_failed", rollback_error=f"{e.code}: {e.message}")
+
+    def _worker_rollback(self, version: str, op_id: str) -> int:
+        current = self.installed_version()
+        st = self._new_op(op_id, "rollback", target=version, previous=current, mode="manual")
+        try:
+            self._switch(st, version)
+            self._verify(st, version)
+        except UpdateError as e:
+            st["error"] = f"{e.code}: {e.message}"
+            return self._finish(st, "failed")
+        return self._finish(st, "succeeded")
+
+    def _worker_recover(self, op_id: str) -> int:
+        """Reconcile an operation interrupted mid-flight (crash, reboot, kill)."""
+        prev = self.load_state()
+        target, previous = prev.get("target"), prev.get("previous")
+        current = self.installed_version()
+        st = self._new_op(op_id, "recover", target=target, previous=previous, mode="recover",
+                          interrupted=prev.get("op_id"), interrupted_phase=prev.get("phase"))
+        # the app may be down mid-switch; bring it back unless it was not running to begin with
+        st["app_was_running"] = prev.get("app_was_running", True)
+        if prev.get("op") == "rollback":
+            previous = target  # interrupted manual rollback: the intended end state is `target`
+        try:
+            if current and target and current == target and prev.get("op") != "rollback":
+                self._ensure_started(st)
+                self._verify(st, target)
+                return self._finish(st, "succeeded", note="interrupted update completed on recovery")
+        except UpdateError as e:
+            st["error"] = f"{e.code}: {e.message}"
+        return self._rollback_after_failure(st, previous)
+
+    def _ensure_started(self, st: dict) -> None:
+        if st.get("app_was_running") and not self.desktop_app_pid():
+            self.start_desktop_app()
+
+    def _switch(self, st: dict, version: str) -> None:
+        meta = self.verify_cached(version)
+        st.setdefault("app_was_running", bool(self.desktop_app_pid()))
+        self.set_phase(st, "stopping_app", switching_to=version)
+        self.stop_desktop_app(st)
+        self.set_phase(st, "installing", switching_to=version)
+        try:
+            cp = self.sys.run([self.cache_path(version), "/S", "/currentuser"],
+                              timeout=self.cfg["install_timeout_seconds"])
+            rc, out = cp.returncode, (cp.stdout or "") + (cp.stderr or "")
+        except subprocess.TimeoutExpired:
+            rc, out = None, "installer timed out"
+        except OSError as e:
+            rc, out = None, str(e)
+        installed = self.installed_version()
+        if rc != 0 or installed != version:
+            st["installer_output"] = f"exit {rc}: {out[-2000:]}"
+            self._ensure_started(st)  # bring the app back with whatever is installed before reporting
+            raise UpdateError("install_failed", f"installer for {version} failed (exit {rc}; installed now: {installed})")
+        self.set_phase(st, "starting_app", switching_to=version, sha256=meta["sha256"])
+        if st["app_was_running"] and not self.desktop_app_pid():
+            self.start_desktop_app()
+
+    def _verify(self, st: dict, version: str) -> None:
+        self.set_phase(st, "verifying", expecting=version)
+        if not st.get("app_was_running"):
+            # the app was not running before, so it stays closed: the installed version is all there is
+            installed = self.installed_version()
+            st["verify"] = {"installed_version": installed, "app_running": False}
+            if installed != version:
+                raise UpdateError("verify_failed", f"installed version is {installed}, expected {version}")
+            self.save_state(st)
+            return
+        deadline = self.clock() + self.cfg["verify_timeout_seconds"]
+        last: dict = {}
+        while self.clock() < deadline:
+            svc = self.service_state()
+            rt = self.runtime_status()
+            last = {"service": svc, "runtime": rt}
+            if svc["MainPID"] and rt.get("reachable") and rt.get("state") == "ready" \
+                    and rt.get("appVersion") == version:
+                break
+            self.sleep(3)
+        else:
+            st["verify"] = last
+            raise UpdateError("verify_timeout", f"app not healthy at {version} within "
+                                                f"{self.cfg['verify_timeout_seconds']}s")
+        pid = last["service"]["MainPID"]
+        self.sleep(self.cfg["stability_seconds"])
+        svc = self.service_state()
+        if svc["MainPID"] != pid:
+            st["verify"] = {"service": svc}
+            raise UpdateError("unstable", "app restarted or exited during stability window")
+        st["verify"] = {**last, "stable": True}
+        self.save_state(st)
+
+
+# --- CLI --------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="orca-desktop-update", description=__doc__.split("\n")[0])
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="show app, version, activity and updater state")
+    c = sub.add_parser("check", help="compare installed version with an official release")
+    c.add_argument("--version", default="latest", type=validate_version_arg)
+    pr = sub.add_parser("prepare", help="download + verify target and rollback installers")
+    pr.add_argument("--version", default="latest", type=validate_version_arg)
+    pr.add_argument("--dry-run", action="store_true")
+    ap = sub.add_parser("apply", help="switch to a prepared version in a detached worker")
+    ap.add_argument("--version", required=True, type=validate_version_arg)
+    ap.add_argument("--mode", choices=["safe", "force"], default="safe")
+    ap.add_argument("--allow-downgrade", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    rb = sub.add_parser("rollback", help="return to the previous (or given) prepared version")
+    rb.add_argument("--to", type=validate_version_arg)
+    rb.add_argument("--dry-run", action="store_true")
+    sub.add_parser("recover", help="reconcile an interrupted operation")
+    w = sub.add_parser("_worker", help=argparse.SUPPRESS)
+    w.add_argument("kind", choices=["update", "rollback", "recover"])
+    w.add_argument("--version", type=validate_version_arg)
+    w.add_argument("--mode", choices=["safe", "force"])
+    w.add_argument("--op-id", required=True)
+    return p
+
+
+def main(argv: list[str] | None = None, updater: Updater | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    u = updater or Updater()
+    try:
+        os.makedirs(u.paths["state_dir"], exist_ok=True)
+        if args.cmd == "status":
+            out = u.cmd_status()
+        elif args.cmd == "check":
+            out = u.cmd_check(args.version)
+        elif args.cmd == "prepare":
+            out = u.cmd_prepare(args.version, args.dry_run)
+        elif args.cmd == "apply":
+            if args.version == "latest":
+                raise UpdateError("invalid_version", "apply needs an explicit X.Y.Z (use the prepared version)")
+            out = u.cmd_apply(args.version, args.mode, args.dry_run, args.allow_downgrade)
+        elif args.cmd == "rollback":
+            out = u.cmd_rollback(args.to, args.dry_run)
+        elif args.cmd == "recover":
+            out = u.cmd_recover()
+        elif args.cmd == "_worker":
+            if os.environ.get(WORKER_ENV) != args.op_id:
+                raise UpdateError("not_a_worker", "_worker is started by apply/rollback/recover only")
+            return u.worker(args.kind, args.version, args.mode, args.op_id)
+        else:
+            raise UpdateError("bad_command", args.cmd)
+    except UpdateError as e:
+        err = {"ok": False, "error": {"code": e.code, "message": e.message}}
+        print(json.dumps(err) if args.json else f"error [{e.code}]: {e.message}",
+              file=sys.stdout if args.json else sys.stderr)
+        return 2
+    # ASCII-only JSON: the client reads it in the console code page
+    print(json.dumps({"ok": True, **out}, indent=None if args.json else 2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
